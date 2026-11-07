@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -144,48 +143,6 @@ class AppRouteTests(unittest.TestCase):
         record_waveform.assert_called_once()
 
 
-    def test_event_inputs_and_routes(self) -> None:
-        from services.event_log import EventLog
-
-        runtime = make_runtime()
-        with tempfile.TemporaryDirectory() as tmp:
-            runtime.events = EventLog(Path(tmp) / "events.json")
-            now = time.time()
-            face_hidden = [[10.0, 10.0, 0.0]] * 3 + [[10.0, 10.0, 0.9]] * 14  # nose/eyes missing, ears visible
-            latest = {"updated_at": now, "captured_at": now, "frame_size": [320, 180], "persons": [{"keypoints": face_hidden}]}
-            runtime.video.vision.latest_result = lambda: latest
-            runtime.audio.pipeline.latest_yamnet = {"status": "ok", "updated_at": now, "crying": True, "cry_score": 0.8}
-
-            active, state, details = runtime.event_inputs(now)
-            self.assertEqual(state, "covered")
-            self.assertEqual(active, {"face_cover_rollover": True, "no_person": False, "boundary": False, "cry": True})
-            self.assertEqual(details["cry"]["score"], 0.8)
-
-            # stale pose result and LLM pause both make vision unknown; cry is still read
-            latest["updated_at"] = now - 30
-            active, state, _ = runtime.event_inputs(now)
-            self.assertEqual((state, active["face_cover_rollover"], active["cry"]), ("stale", None, True))
-            latest["updated_at"] = now
-            runtime.vision.pause("assistant")
-            self.assertEqual(runtime.event_inputs(now)[1], "paused")
-            runtime.vision.resume("assistant")
-
-            for second in range(4):
-                runtime.observe_events(now + second)
-            client = create_main_app(runtime).test_client()
-            listed = client.get("/api/events?limit=10").get_json()
-            self.assertIs(listed["ok"], True)
-            self.assertEqual(sorted(e["type"] for e in listed["result"]), ["cry", "face_cover_rollover"])
-            only_cry = client.get("/api/events?type=cry").get_json()["result"]
-            self.assertEqual([e["type"] for e in only_cry], ["cry"])
-            summary = client.get("/api/events/summary?window_s=3600").get_json()["result"]
-            self.assertEqual(summary["types"]["cry"]["count"], 1)
-            self.assertEqual(summary["current"]["vision_state"], "covered")
-            bad = client.get("/api/events?type=sneeze")
-            self.assertEqual(bad.status_code, 400)
-            self.assertIs(bad.get_json()["ok"], False)
-            self.assertEqual(client.get("/api/events/summary?window_s=5").status_code, 400)
-
     def test_assistant_routes(self) -> None:
         from tests.test_chat_assistant import FakeOllama
 
@@ -221,6 +178,76 @@ class AppRouteTests(unittest.TestCase):
             runtime.assistant.settings = type(runtime.assistant.settings)(enabled=False)
             off = client.post("/api/assistant/chat", json={"messages": [{"role": "user", "content": "q"}]})
             self.assertEqual(off.status_code, 503)
+
+    def test_event_inputs(self) -> None:
+        from k1edge.runtime import event_inputs
+        from tests.test_event_log import BACK, FACE_DOWN, SIDE
+
+        now = 1_800_000_000.0
+        yamnet = {"status": "ok", "crying": True, "cry_score": 0.7, "updated_at": now - 1}
+
+        def vision(persons=None, age=0.5, paused=False, model_active=True):
+            latest = {"updated_at": now - age, "frame_size": [320, 180], "model_active": model_active,
+                      "persons": [{"keypoints": k} for k in (persons or [])]}
+            return {"paused": paused, "latest": latest}
+
+        observed, state, details = event_inputs(vision([BACK]), True, yamnet, {"zone": None}, now)
+        self.assertEqual(state, "visible")
+        self.assertEqual(observed, {"cry": True, "face_cover_rollover": False, "boundary": False, "no_person": False})
+        self.assertEqual((details["posture"], details["cry_score"]), ("back", 0.7))
+
+        observed, state, details = event_inputs(vision([FACE_DOWN]), True, None, {"zone": None}, now)
+        self.assertEqual((state, observed["face_cover_rollover"], observed["cry"]), ("covered", True, None))
+        self.assertEqual(event_inputs(vision([SIDE]), True, None, {}, now)[2]["posture"], "side")
+        self.assertEqual(event_inputs(vision([SIDE]), True, None, {}, now, side_ratio=0)[1], "visible")
+
+        observed, state, _ = event_inputs(vision([]), True, None, {}, now)
+        self.assertEqual((state, observed["no_person"], observed["face_cover_rollover"]), ("no_person", True, False))
+
+        # can't tell -> None for every vision type
+        for args, expected in (
+            ((vision([FACE_DOWN], age=6), True), "stale"),
+            ((vision([FACE_DOWN], paused=True), True), "paused"),
+            ((vision([FACE_DOWN]), False), "unknown"),
+            ((vision([FACE_DOWN], model_active=False), True), "unknown"),
+        ):
+            observed, state, _ = event_inputs(*args, yamnet, {}, now)
+            self.assertEqual(state, expected)
+            self.assertEqual([observed[t] for t in ("face_cover_rollover", "boundary", "no_person")], [None, None, None])
+            self.assertIs(observed["cry"], True)  # the microphone is unaffected
+
+        stale_yamnet = {**yamnet, "updated_at": now - 30}
+        self.assertIsNone(event_inputs(vision([BACK]), True, stale_yamnet, {}, now)[0]["cry"])
+        self.assertIsNone(event_inputs(vision([BACK]), True, {"status": "warming"}, {}, now)[0]["cry"])
+
+    def test_event_routes(self) -> None:
+        from services.event_log import EventLog
+
+        runtime = make_runtime()
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime.events = EventLog(Path(tmp) / "events.json")
+            start = runtime.events.clock() - 20
+            for second in range(5):
+                runtime.events.observe({"face_cover_rollover": True}, now=start + second, vision_state="covered",
+                                       details={"posture": "side"})
+            client = create_main_app(runtime).test_client()
+
+            listed = client.get(f"/api/events?type=face_cover_rollover&since={int(start * 1000)}").get_json()
+            self.assertIs(listed["ok"], True)
+            self.assertEqual(len(listed["result"]), 1)
+            self.assertEqual(listed["result"][0]["posture"], "side")
+            summary = client.get("/api/events/summary?window_s=600")
+            self.assertEqual(summary.headers["Cache-Control"], "no-store, no-cache, must-revalidate")
+            self.assertEqual(summary.get_json()["result"]["types"]["face_cover_rollover"]["count"], 1)
+
+            bad = client.get("/api/events?type=sneeze")
+            self.assertEqual(bad.status_code, 400)
+            self.assertEqual(bad.get_json(), {"ok": False, "error": "type must be one of cry, face_cover_rollover, boundary, no_person"})
+            self.assertEqual(client.get("/api/events?limit=0").status_code, 400)
+            self.assertEqual(client.get("/api/events/summary?window_s=5").get_json()["error"], "window_s must be between 60 and 604800")
+
+            runtime.sample_events()  # no camera in tests: vision inputs are unknown, nothing breaks
+            self.assertEqual(runtime.events.summary()["current"]["vision_state"], "unknown")
 
 
 if __name__ == "__main__":

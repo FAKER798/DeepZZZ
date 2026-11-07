@@ -1,28 +1,26 @@
-"""Vision / sound episodes for the naviga app and the AI Q&A context.
+"""Vision / cry events for the naviga app (/api/events, /api/events/summary).
 
-AppRuntime calls EventLog.observe() once a second with the current state of each
-event type (True / False, or None when that input is unknown right now: camera off,
-pose result stale, LLM answering with YOLO paused, YAMNet warming up). The log turns
-those samples into episodes:
+Once a second the main service hands EventLog.observe() the current vision and YAMNet
+state; it turns them into events with a start, an end and a duration, saved in
+runtime/care/events.json (see 接口文档.md for the API contract).
 
-    {"id": "...", "type": "cry", "source": "yamnet", "start_at": 1790000000.0,
-     "end_at": 1790000180.0, "duration_s": 180.0, "ongoing": false, "peak_score": 0.83}
+Event types (the app's BoardEventType):
+    cry                  YAMNet cry state machine says crying
+    face_cover_rollover  nose and both eyes not visible (face down / covered), or the baby
+                         lies on its side (shoulders seen edge-on); every roll-over away
+                         from the back shows up as one event in the app ("遮脸/翻身")
+    boundary             a trusted body keypoint is outside the safe zone
+    no_person            nobody detected
 
-- An episode opens after the condition has been true for `open_s` (pose rules are
-  single-frame, so face cover needs 2 s; YAMNet's own tracker already smooths cry).
-- It closes after the condition has been false for `close_s`; the end time is the last
-  sample that was still true.
-- A new episode within `merge_s` of the previous one of the same type reopens it, so
-  a baby who keeps rolling back and forth is one episode, not ten.
-- Unknown samples never open or close anything. If an open episode stays unknown for
-  `unknown_close_s` (camera died, service stopped watching) it is closed at its last
-  true sample and marked "interrupted".
-
-Episodes are kept for 7 days (max 5000) in runtime/care/events.json.
+Each input is True / False / None. None means "can't tell right now" (camera off,
+pose result stale, YOLO paused for the local LLM, YAMNet not ready): it neither starts
+nor ends an event, and after UNKNOWN_INTERRUPT_S an ongoing event is closed at its last
+confirmed moment with interrupted=True.
 """
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 from dataclasses import dataclass
@@ -32,222 +30,313 @@ from typing import Any, Callable
 from k1edge.runtime_store import read_json, write_json
 
 EVENT_TYPES = ("cry", "face_cover_rollover", "boundary", "no_person")
-EVENT_SOURCES = {"cry": "yamnet", "face_cover_rollover": "vision", "boundary": "vision", "no_person": "vision"}
+SOURCES = {"cry": "yamnet", "face_cover_rollover": "vision", "boundary": "vision", "no_person": "vision"}
 VISION_STATES = ("visible", "covered", "no_person", "paused", "stale", "unknown")
-KEEP_S = 7 * 86400
-MAX_EVENTS = 5000
-MAX_LIST = 1000
-DEFAULT_LIST = 100
-MIN_WINDOW_S = 60.0
-MAX_WINDOW_S = 7 * 86400.0
-VISION_STATE_MAX_AGE_S = 10.0
-OPEN_PERSIST_S = 30.0  # rewrite the file this often while an episode is open (keeps last_seen_at fresh)
-
-
-class EventLogError(Exception):
-    """Bad query parameters; maps to a plain JSON error."""
-
-    def __init__(self, message: str, status: int = 400) -> None:
-        super().__init__(message)
-        self.status = status
 
 
 @dataclass(frozen=True)
-class EventRule:
-    open_s: float
-    close_s: float
-    merge_s: float
+class Rule:
+    start_s: float  # condition must hold this long before an event starts
+    end_s: float  # condition must be false this long before the event ends
 
 
-DEFAULT_RULES = {
-    "cry": EventRule(open_s=0.0, close_s=3.0, merge_s=30.0),
-    "face_cover_rollover": EventRule(open_s=2.0, close_s=5.0, merge_s=30.0),
-    "boundary": EventRule(open_s=2.0, close_s=5.0, merge_s=30.0),
-    "no_person": EventRule(open_s=5.0, close_s=5.0, merge_s=30.0),
+RULES = {
+    "cry": Rule(start_s=0.0, end_s=3.0),  # the YAMNet state machine already smooths
+    "face_cover_rollover": Rule(start_s=2.0, end_s=5.0),
+    "boundary": Rule(start_s=2.0, end_s=5.0),
+    "no_person": Rule(start_s=5.0, end_s=5.0),
 }
+MERGE_GAP_S = 30.0  # same type again within 30 s of the end -> same event continues
+ROLL_FROM_BACK_S = 60.0  # face up this recently before a face_cover_rollover -> from_posture "back"
+UNKNOWN_INTERRUPT_S = 120.0
+FLUSH_INTERVAL_S = 30.0  # rewrite last_seen_at of ongoing events this often
+RETENTION_S = 7 * 86400.0
+MAX_EVENTS = 5000
+SAMPLE_MAX_AGE_S = 10.0  # current vision_state older than this -> "unknown"
+DEFAULT_LIMIT = 100
+MAX_LIMIT = 1000
+MIN_WINDOW_S = 60.0
+MAX_WINDOW_S = 604800.0
+
+# ---------------------------------------------------------------- pose -> posture
+
+KEYPOINT_THRESHOLD = 0.25  # same as the face / safe-zone checks
+NOSE, LEFT_EYE, RIGHT_EYE, LEFT_EAR, RIGHT_EAR = 0, 1, 2, 3, 4
+LEFT_SHOULDER, RIGHT_SHOULDER, LEFT_HIP, RIGHT_HIP = 5, 6, 11, 12
+# Seen from above, a baby on its back has shoulders about as wide as the shoulder-to-hip
+# distance (ratio ~0.8-1.0); on its side the shoulders stack up and the ratio drops.
+SIDE_SHOULDER_RATIO = 0.4
+MIN_TORSO_PX = 8.0  # torso shorter than this (in 320x180 frames) is too small to judge
 
 
-def parse_time(value: Any, name: str) -> float | None:
-    """Seconds or milliseconds since the epoch (the app sends milliseconds)."""
-    if value in (None, ""):
+class EventLogError(ValueError):
+    """Bad query parameter -> HTTP 400."""
+
+
+def _point(keypoints: list[Any], index: int) -> tuple[float, float, float]:
+    try:
+        x, y, confidence = keypoints[index][:3]
+        return float(x), float(y), float(confidence or 0.0)
+    except (IndexError, TypeError, ValueError):
+        return 0.0, 0.0, 0.0
+
+
+def classify_posture(keypoints: list[Any], side_ratio: float = SIDE_SHOULDER_RATIO) -> dict[str, Any]:
+    """posture: back (face up) | side | face_down (nose and eyes hidden: prone or covered).
+
+    side_ratio <= 0 turns side-lying detection off (only face_down counts).
+    """
+    seen = [_point(keypoints, i)[2] >= KEYPOINT_THRESHOLD for i in range(max(17, len(keypoints)))]
+    face_visible = seen[NOSE] or seen[LEFT_EYE] or seen[RIGHT_EYE]
+    result: dict[str, Any] = {"posture": "back", "shoulder_ratio": None}
+    if not face_visible:
+        result["posture"] = "face_down"
+        return result
+
+    if not (seen[LEFT_SHOULDER] and seen[RIGHT_SHOULDER] and (seen[LEFT_HIP] or seen[RIGHT_HIP])):
+        return result  # body hidden (blanket): face is visible, nothing more to judge
+    ls, rs = _point(keypoints, LEFT_SHOULDER), _point(keypoints, RIGHT_SHOULDER)
+    hips = [_point(keypoints, i) for i in (LEFT_HIP, RIGHT_HIP) if seen[i]]
+    shoulder_mid = ((ls[0] + rs[0]) / 2, (ls[1] + rs[1]) / 2)
+    hip_mid = (sum(h[0] for h in hips) / len(hips), sum(h[1] for h in hips) / len(hips))
+    torso = math.dist(shoulder_mid, hip_mid)
+    if torso < MIN_TORSO_PX:
+        return result
+    ratio = math.dist(ls[:2], rs[:2]) / torso
+    result["shoulder_ratio"] = round(ratio, 3)
+    both_eyes = seen[LEFT_EYE] and seen[RIGHT_EYE]
+    if side_ratio > 0 and ratio < side_ratio and not both_eyes:
+        result["posture"] = "side"
+    return result
+
+
+# ---------------------------------------------------------------- helpers
+
+
+def to_seconds(value: Any, name: str) -> float | None:
+    """Query time in seconds or milliseconds (> 1e11 is taken as ms, which the app sends)."""
+    if value is None or value == "":
         return None
     try:
         number = float(value)
     except (TypeError, ValueError):
-        raise EventLogError(f"{name} must be a number (seconds or milliseconds since epoch)") from None
-    if number < 0:
-        raise EventLogError(f"{name} must not be negative")
+        raise EventLogError(f"{name} must be a number") from None
+    if not math.isfinite(number) or number < 0:
+        raise EventLogError(f"{name} must be a non-negative number")
     return number / 1000.0 if number > 1e11 else number
 
 
-class _Tracker:
-    """Per-type state between samples."""
+def parse_limit(value: Any) -> int:
+    if value is None or value == "":
+        return DEFAULT_LIMIT
+    try:
+        limit = int(str(value))
+    except ValueError:
+        raise EventLogError("limit must be an integer") from None
+    if limit < 1:
+        raise EventLogError("limit must be at least 1")
+    return min(limit, MAX_LIMIT)
+
+
+def _round(value: float | None) -> float | None:
+    return None if value is None else round(float(value), 3)
+
+
+class _Track:
+    """Debounce state of one event type (not persisted)."""
 
     def __init__(self) -> None:
-        self.true_since: float | None = None   # first true sample of the current true run
-        self.false_since: float | None = None  # first false sample of the current false run
-        self.last_true: float | None = None    # last true sample
-        self.last_known: float | None = None   # last sample that was not None
-        self.open_id: str | None = None        # id of the open episode, if any
+        self.true_since: float | None = None  # start of the current run of True samples
+        self.false_since: float | None = None  # first False sample since the last True
+        self.unknown_since: float | None = None
 
 
 class EventLog:
     def __init__(
         self,
-        path: Path | None,
+        path: Path,
         clock: Callable[[], float] = time.time,
-        rules: dict[str, EventRule] | None = None,
+        rules: dict[str, Rule] | None = None,
     ) -> None:
         self.path = path
         self.clock = clock
-        self.rules = {**DEFAULT_RULES, **(rules or {})}
-        self.unknown_close_s = 120.0
+        self.rules = rules or RULES
         self._lock = threading.Lock()
-        self._trackers = {name: _Tracker() for name in EVENT_TYPES}
+        self._tracks = {name: _Track() for name in EVENT_TYPES}
+        self._current: dict[str, Any] = {"vision_state": "unknown", "vision_state_at": None}
+        self._last_flush = 0.0
+        self._last_back_at: float | None = None
         self._events: list[dict[str, Any]] = []
-        self._vision_state = "unknown"
-        self._vision_state_at: float | None = None
-        self._persisted_at = 0.0
         self._load()
 
-    # ---------------------------------------------------------------- storage
+    # ------------------------------------------------------------ storage
 
     def _load(self) -> None:
-        if self.path is None:
-            return
-        payload = read_json(self.path)
-        events = [dict(e) for e in payload.get("events") or [] if isinstance(e, dict) and e.get("type") in EVENT_TYPES]
+        payload = read_json(self.path, default={"events": []})
+        events = [e for e in payload.get("events") or [] if isinstance(e, dict) and e.get("type") in EVENT_TYPES]
         changed = False
         for event in events:
-            if event.get("end_at") is None:
-                # The service stopped while this episode was open: end it where it was last seen.
-                end = float(event.get("last_seen_at") or event.get("start_at") or 0.0)
-                event["end_at"] = round(end, 3)
-                event["duration_s"] = round(max(0.0, end - float(event.get("start_at") or end)), 1)
-                event["ongoing"] = False
+            if event.get("end_at") is None:  # the service stopped while it was ongoing
+                event["end_at"] = event.get("last_seen_at") or event.get("start_at")
                 event["interrupted"] = True
                 changed = True
         self._events = events
-        if changed:
-            self._save(self.clock())
+        if self._prune(self.clock()) or changed:
+            self._save()
 
-    def _save(self, now: float) -> None:
-        cutoff = now - KEEP_S
-        self._events = [e for e in self._events if e.get("end_at") is None or float(e["end_at"]) >= cutoff][-MAX_EVENTS:]
-        self._persisted_at = now
-        if self.path is not None:
-            write_json(self.path, {"updated_at": now, "events": self._events})
+    def _save(self) -> None:
+        write_json(self.path, {"events": self._events})
+        self._last_flush = self.clock()
 
-    def _find(self, event_id: str | None) -> dict[str, Any] | None:
-        if event_id is None:
-            return None
-        return next((e for e in reversed(self._events) if e.get("id") == event_id), None)
+    def _prune(self, now: float) -> bool:
+        before = len(self._events)
+        keep = [e for e in self._events if e.get("end_at") is None or float(e["end_at"]) >= now - RETENTION_S]
+        keep.sort(key=lambda e: float(e.get("start_at") or 0.0))
+        self._events = keep[-MAX_EVENTS:]
+        return len(self._events) != before
 
-    # ---------------------------------------------------------------- observing
+    def _ongoing(self, event_type: str) -> dict[str, Any] | None:
+        for event in reversed(self._events):
+            if event["type"] == event_type and event.get("end_at") is None:
+                return event
+        return None
+
+    def _latest(self, event_type: str) -> dict[str, Any] | None:
+        for event in reversed(self._events):
+            if event["type"] == event_type:
+                return event
+        return None
+
+    # ------------------------------------------------------------ sampling
 
     def observe(
         self,
-        active: dict[str, bool | None],
+        observed: dict[str, bool | None],
         now: float | None = None,
-        vision_state: str | None = None,
-        details: dict[str, dict[str, Any]] | None = None,
-    ) -> list[dict[str, Any]]:
-        """Feed one sample per event type; returns the episodes opened or closed by it."""
+        vision_state: str = "unknown",
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        """One sample: observed[type] is True / False / None (unknown) for each event type.
+
+        details may carry cry_score (kept as peak_score) and posture (kept on the
+        face_cover_rollover event: side / face_down, and the posture it rolled from).
+        """
         now = self.clock() if now is None else float(now)
         details = details or {}
-        changes: list[dict[str, Any]] = []
+        dirty = False
         with self._lock:
-            if vision_state is not None:
-                self._vision_state = vision_state if vision_state in VISION_STATES else "unknown"
-                self._vision_state_at = now
-            dirty = False
-            for name in EVENT_TYPES:
-                change = self._step(name, active.get(name), now, details.get(name) or {})
-                if change is not None:
-                    changes.append(dict(change))
-                    dirty = True
-            if not dirty and any(t.open_id for t in self._trackers.values()) and now - self._persisted_at >= OPEN_PERSIST_S:
-                dirty = True
+            self._current = {
+                "vision_state": vision_state if vision_state in VISION_STATES else "unknown",
+                "vision_state_at": now,
+                "posture": details.get("posture"),
+                "shoulder_ratio": details.get("shoulder_ratio"),
+            }
+            if details.get("posture") == "back":
+                self._last_back_at = now
+            for event_type in EVENT_TYPES:
+                dirty |= self._step(event_type, observed.get(event_type), now, details)
             if dirty:
-                self._save(now)
-        return changes
+                self._prune(now)
+                self._save()
+            elif any(e.get("end_at") is None for e in self._events) and now - self._last_flush >= FLUSH_INTERVAL_S:
+                self._save()
 
-    def _step(self, name: str, value: bool | None, now: float, detail: dict[str, Any]) -> dict[str, Any] | None:
-        tracker = self._trackers[name]
-        rule = self.rules[name]
-        open_event = self._find(tracker.open_id)
+    def _step(self, event_type: str, value: bool | None, now: float, details: dict[str, Any]) -> bool:
+        track = self._tracks[event_type]
+        rule = self.rules[event_type]
+        event = self._ongoing(event_type)
         if value is None:
-            if open_event is not None and tracker.last_known is not None and now - tracker.last_known >= self.unknown_close_s:
-                return self._close(tracker, open_event, interrupted=True)
-            return None
-        tracker.last_known = now
+            if track.unknown_since is None:
+                track.unknown_since = now
+            # A run of True / False must be seen without gaps to start / end an event.
+            track.true_since = track.false_since = None
+            if event is not None and now - track.unknown_since >= UNKNOWN_INTERRUPT_S:
+                self._finish(event, interrupted=True)
+                track.true_since = track.false_since = None
+                return True
+            return False
+        track.unknown_since = None
+
         if value:
-            tracker.false_since = None
-            tracker.last_true = now
-            if tracker.true_since is None:
-                tracker.true_since = now
-            if open_event is not None:
-                open_event["last_seen_at"] = round(now, 3)
-                self._update_peak(open_event, detail)
-                return None
-            if now - tracker.true_since < rule.open_s:
-                return None
-            return self._open(name, tracker, rule, detail)
-        tracker.true_since = None
-        if open_event is None:
-            return None
-        if tracker.false_since is None:
-            tracker.false_since = now
-        if now - tracker.false_since >= rule.close_s:
-            return self._close(tracker, open_event)
-        return None
+            track.false_since = None
+            if track.true_since is None:
+                track.true_since = now
+            if event is not None:
+                event["last_seen_at"] = now
+                self._update_details(event, details)
+                return False
+            if now - track.true_since < rule.start_s:
+                return False
+            self._begin(event_type, track.true_since, now, details)
+            return True
 
-    def _open(self, name: str, tracker: _Tracker, rule: EventRule, detail: dict[str, Any]) -> dict[str, Any]:
-        start = float(tracker.true_since or tracker.last_true or self.clock())
-        previous = next((e for e in reversed(self._events) if e.get("type") == name), None)
-        if previous is not None and previous.get("end_at") is not None and start - float(previous["end_at"]) <= rule.merge_s:
-            # Same episode resumed: reopen it instead of starting a new one.
-            previous.update({"end_at": None, "duration_s": None, "ongoing": True, "last_seen_at": round(tracker.last_true or start, 3)})
-            previous["merged"] = int(previous.get("merged") or 0) + 1
+        track.true_since = None
+        if event is None:
+            return False
+        if track.false_since is None:
+            track.false_since = now
+        if now - track.false_since >= rule.end_s:
+            self._finish(event)
+            track.false_since = None
+            return True
+        return False
+
+    def _begin(self, event_type: str, start_at: float, now: float, details: dict[str, Any]) -> None:
+        previous = self._latest(event_type)
+        if previous is not None and previous.get("end_at") is not None and start_at - float(previous["end_at"]) <= MERGE_GAP_S:
+            previous["end_at"] = None
             previous.pop("interrupted", None)
-            self._update_peak(previous, detail)
-            tracker.open_id = previous["id"]
-            return previous
-        event = {
-            "id": f"{name}-{int(start * 1000)}",
-            "type": name,
-            "source": EVENT_SOURCES[name],
-            "start_at": round(start, 3),
+            previous["merged"] = int(previous.get("merged") or 0) + 1
+            previous["last_seen_at"] = now
+            self._update_details(previous, details)
+            return
+        event: dict[str, Any] = {
+            "id": f"{event_type}-{int(round(start_at * 1000))}",
+            "type": event_type,
+            "source": SOURCES[event_type],
+            "start_at": start_at,
             "end_at": None,
-            "duration_s": None,
-            "ongoing": True,
-            "last_seen_at": round(tracker.last_true or start, 3),
+            "last_seen_at": now,
         }
-        self._update_peak(event, detail)
+        if event_type == "face_cover_rollover":
+            # Seen face up shortly before: a real roll-over rather than e.g. a blanket
+            # that was already over the face when the camera started.
+            if self._last_back_at is not None and start_at - self._last_back_at <= ROLL_FROM_BACK_S:
+                event["from_posture"] = "back"
+        self._update_details(event, details)
         self._events.append(event)
-        tracker.open_id = event["id"]
-        return event
 
-    def _close(self, tracker: _Tracker, event: dict[str, Any], interrupted: bool = False) -> dict[str, Any]:
-        end = float(tracker.last_true or event.get("last_seen_at") or event["start_at"])
-        event["end_at"] = round(end, 3)
-        event["duration_s"] = round(max(0.0, end - float(event["start_at"])), 1)
-        event["ongoing"] = False
-        event["last_seen_at"] = round(end, 3)
+    def _update_details(self, event: dict[str, Any], details: dict[str, Any]) -> None:
+        if event["type"] == "cry" and details.get("cry_score") is not None:
+            event["peak_score"] = round(max(float(event.get("peak_score") or 0.0), float(details["cry_score"])), 4)
+        elif event["type"] == "face_cover_rollover" and details.get("posture") in {"side", "face_down"}:
+            event["posture"] = details["posture"]
+
+    def _finish(self, event: dict[str, Any], interrupted: bool = False) -> None:
+        event["end_at"] = event.get("last_seen_at") or event["start_at"]
         if interrupted:
             event["interrupted"] = True
-        tracker.open_id = None
-        tracker.true_since = None
-        tracker.false_since = None
-        return event
 
-    @staticmethod
-    def _update_peak(event: dict[str, Any], detail: dict[str, Any]) -> None:
-        score = detail.get("score")
-        if isinstance(score, (int, float)):
-            event["peak_score"] = round(max(float(score), float(event.get("peak_score") or 0.0)), 4)
+    # ------------------------------------------------------------ queries
 
-    # ---------------------------------------------------------------- queries
+    def _public(self, event: dict[str, Any], now: float) -> dict[str, Any]:
+        end = event.get("end_at")
+        ongoing = end is None
+        duration = (now if ongoing else float(end)) - float(event["start_at"])
+        result = {
+            "id": event["id"],
+            "type": event["type"],
+            "source": event["source"],
+            "start_at": _round(event["start_at"]),
+            "end_at": _round(end),
+            "duration_s": round(max(0.0, duration), 1),
+            "ongoing": ongoing,
+            "last_seen_at": _round(event.get("last_seen_at")),
+        }
+        for key in ("peak_score", "merged", "interrupted", "posture", "from_posture"):
+            if event.get(key) is not None:
+                result[key] = event[key]
+        return result
 
     def list_events(
         self,
@@ -256,85 +345,82 @@ class EventLog:
         event_type: Any = None,
         limit: Any = None,
     ) -> list[dict[str, Any]]:
-        """Newest first. An ongoing episode counts as overlapping any range up to now."""
-        since_s = parse_time(since, "since")
-        until_s = parse_time(until, "until")
+        since_s = to_seconds(since, "since")
+        until_s = to_seconds(until, "until")
         if event_type not in (None, "") and event_type not in EVENT_TYPES:
-            raise EventLogError(f"type must be one of {', '.join(EVENT_TYPES)}")
-        if limit in (None, ""):
-            count = DEFAULT_LIST
-        else:
-            try:
-                count = int(limit)
-            except (TypeError, ValueError):
-                raise EventLogError("limit must be an integer") from None
-            if count < 1:
-                raise EventLogError("limit must be at least 1")
-        count = min(count, MAX_LIST)
+            raise EventLogError("type must be one of " + ", ".join(EVENT_TYPES))
+        count = parse_limit(limit)
         now = self.clock()
-        result = []
         with self._lock:
-            for event in reversed(self._events):
-                if event_type and event.get("type") != event_type:
-                    continue
-                start = float(event["start_at"])
-                end = float(event["end_at"]) if event.get("end_at") is not None else now
-                if since_s is not None and end < since_s:
-                    continue
-                if until_s is not None and start > until_s:
-                    continue
-                result.append(self._public(event, now))
-                if len(result) >= count:
-                    break
+            events = list(self._events)
+        result = []
+        for event in sorted(events, key=lambda e: float(e["start_at"]), reverse=True):
+            if event_type and event["type"] != event_type:
+                continue
+            end = now if event.get("end_at") is None else float(event["end_at"])
+            if since_s is not None and end < since_s:
+                continue
+            if until_s is not None and float(event["start_at"]) > until_s:
+                continue
+            result.append(self._public(event, now))
+            if len(result) >= count:
+                break
         return result
 
-    def summary(self, window_s: Any = 7200.0, now: float | None = None) -> dict[str, Any]:
-        """Per-type counts for the last window_s seconds plus the current camera state."""
-        try:
-            window = float(window_s)
-        except (TypeError, ValueError):
-            raise EventLogError("window_s must be a number of seconds") from None
-        if not MIN_WINDOW_S <= window <= MAX_WINDOW_S:
-            raise EventLogError(f"window_s must be between {int(MIN_WINDOW_S)} and {int(MAX_WINDOW_S)}")
-        now = self.clock() if now is None else float(now)
+    def summary(self, window_s: Any = None) -> dict[str, Any]:
+        if window_s is None or window_s == "":
+            window = 7200.0
+        else:
+            try:
+                window = float(window_s)
+            except (TypeError, ValueError):
+                raise EventLogError("window_s must be a number") from None
+            if not (MIN_WINDOW_S <= window <= MAX_WINDOW_S):
+                raise EventLogError(f"window_s must be between {int(MIN_WINDOW_S)} and {int(MAX_WINDOW_S)}")
+        now = self.clock()
         since = now - window
         with self._lock:
-            types: dict[str, Any] = {}
-            active = []
-            for name in EVENT_TYPES:
-                hits = []
-                for event in self._events:
-                    if event.get("type") != name:
-                        continue
-                    end = float(event["end_at"]) if event.get("end_at") is not None else now
-                    if end >= since and float(event["start_at"]) <= now:
-                        hits.append((event, end))
-                total = sum(max(0.0, min(end, now) - max(float(e["start_at"]), since)) for e, end in hits)
-                latest = max(hits, key=lambda item: float(item[0]["start_at"]))[0] if hits else None
-                types[name] = {
-                    "count": len(hits),
-                    "total_s": round(total, 1),
-                    "latest": self._public(latest, now) if latest else None,
-                }
-                if latest is not None and latest.get("end_at") is None:
-                    active.append(name)
-            fresh = self._vision_state_at is not None and now - self._vision_state_at <= VISION_STATE_MAX_AGE_S
-            return {
-                "now": round(now, 3),
-                "window_s": window,
-                "since": round(since, 3),
-                "current": {
-                    "vision_state": self._vision_state if fresh else "unknown",
-                    "vision_state_at": self._vision_state_at,
-                    "active": active,
-                },
-                "types": types,
+            events = list(self._events)
+            current = dict(self._current)
+        state_at = current.get("vision_state_at")
+        state = current.get("vision_state") or "unknown"
+        if state_at is None or now - float(state_at) > SAMPLE_MAX_AGE_S:
+            state = "unknown"
+        types: dict[str, Any] = {}
+        for event_type in EVENT_TYPES:
+            matching = []
+            total = 0.0
+            for event in events:
+                if event["type"] != event_type:
+                    continue
+                end = now if event.get("end_at") is None else float(event["end_at"])
+                if end < since:
+                    continue
+                matching.append(event)
+                total += max(0.0, end - max(float(event["start_at"]), since))
+            latest = max(matching, key=lambda e: float(e["start_at"])) if matching else None
+            types[event_type] = {
+                "count": len(matching),
+                "total_s": round(total, 1),
+                "latest": self._public(latest, now) if latest else None,
             }
-
-    @staticmethod
-    def _public(event: dict[str, Any], now: float) -> dict[str, Any]:
-        item = dict(event)
-        if item.get("end_at") is None:
-            item["duration_s"] = round(max(0.0, now - float(item["start_at"])), 1)
-            item["ongoing"] = True
-        return item
+        rollovers = [
+            e for e in events
+            if e["type"] == "face_cover_rollover" and (now if e.get("end_at") is None else float(e["end_at"])) >= since
+        ]
+        types["face_cover_rollover"]["side_count"] = sum(1 for e in rollovers if e.get("posture") == "side")
+        types["face_cover_rollover"]["face_down_count"] = sum(1 for e in rollovers if e.get("posture") == "face_down")
+        active = [e["type"] for e in events if e.get("end_at") is None]
+        return {
+            "now": round(now, 3),
+            "since": round(since, 3),
+            "window_s": window,
+            "current": {
+                "vision_state": state,
+                "vision_state_at": _round(state_at),
+                "active": [t for t in EVENT_TYPES if t in active],
+                "posture": current.get("posture") if state not in {"unknown", "stale", "paused"} else None,
+                "shoulder_ratio": current.get("shoulder_ratio") if state not in {"unknown", "stale", "paused"} else None,
+            },
+            "types": types,
+        }

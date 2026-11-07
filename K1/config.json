@@ -97,5 +97,8 @@
     "min_speech_s": 0.5,
     "max_speech_s": 5.0,
     "pre_roll_s": 0.15
+  },
+  "events": {
+    "side_shoulder_ratio": 0.4
   }
 }

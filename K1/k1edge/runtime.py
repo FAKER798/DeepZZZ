@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 import time
 from typing import Any
@@ -15,16 +16,82 @@ from services.resources import ResourceMonitor
 from services.activity_zone import ActivityZoneStore, safe_zone_detection_status
 from services.care_log import CareStore
 from services.chat_assistant import ChatAssistant, WorkloadPauser, load_assistant_settings
-from services.event_log import EventLog
+from services.event_log import EVENT_TYPES, SIDE_SHOULDER_RATIO, EventLog, classify_posture
 from services.voice_trigger import read_voice_trigger_status, write_voice_trigger_command
 from utils.metrics import age_seconds
-from utils.paths import ACTIVITY_ZONE_FILE, CARE_PROFILE_FILE, CARE_RECORDS_FILE, EVENT_LOG_FILE
+from utils.paths import ACTIVITY_ZONE_FILE, CARE_EVENTS_FILE, CARE_PROFILE_FILE, CARE_RECORDS_FILE, PROJECT_ROOT
 
 
 FACE_POINT_THRESHOLD = 0.25
-# Pose / YAMNet results older than this are treated as unknown by the event log.
-EVENT_INPUT_MAX_AGE_S = 5.0
-EVENT_WATCH_INTERVAL_S = 1.0
+EVENT_SAMPLE_S = 1.0
+VISION_STALE_S = 5.0  # pose result older than this -> vision inputs unknown
+YAMNET_STALE_S = 10.0
+
+
+def load_side_shoulder_ratio() -> float:
+    """config.json "events": {"side_shoulder_ratio": 0.4}; 0 turns side-lying detection off."""
+    try:
+        values = json.loads((PROJECT_ROOT / "config.json").read_text(encoding="utf-8")).get("events") or {}
+        return float(values.get("side_shoulder_ratio", SIDE_SHOULDER_RATIO))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return SIDE_SHOULDER_RATIO
+
+
+def event_inputs(
+    vision: dict[str, Any],
+    camera_running: bool,
+    yamnet: dict[str, Any] | None,
+    zone_status: dict[str, Any],
+    now: float,
+    side_ratio: float = SIDE_SHOULDER_RATIO,
+) -> tuple[dict[str, bool | None], str, dict[str, Any]]:
+    """Current vision / YAMNet state -> (observed per event type, vision_state, details).
+
+    None = can't tell (camera off, stale pose, YOLO paused for the LLM, YAMNet not ready).
+    """
+    observed: dict[str, bool | None] = {name: None for name in EVENT_TYPES}
+    details: dict[str, Any] = {}
+
+    if isinstance(yamnet, dict) and yamnet.get("status") == "ok":
+        try:
+            fresh = now - float(yamnet.get("updated_at")) <= YAMNET_STALE_S
+        except (TypeError, ValueError):
+            fresh = False
+        if fresh:
+            observed["cry"] = yamnet.get("crying") is True
+            if yamnet.get("cry_score") is not None:
+                details["cry_score"] = float(yamnet["cry_score"])
+
+    latest = vision.get("latest")
+    if vision.get("paused"):
+        return observed, "paused", details
+    if not camera_running or not isinstance(latest, dict) or latest.get("model_active") is False:
+        return observed, "unknown", details
+    try:
+        age = now - float(latest.get("updated_at") or latest.get("captured_at"))
+    except (TypeError, ValueError):
+        return observed, "unknown", details
+    if age > VISION_STALE_S:
+        return observed, "stale", details
+
+    persons = latest.get("persons") or []
+    person = persons[0] if isinstance(persons, list) and persons else None
+    keypoints = person.get("keypoints") if isinstance(person, dict) else None
+    if not isinstance(keypoints, list):
+        observed.update({"no_person": True, "face_cover_rollover": False, "boundary": False})
+        return observed, "no_person", details
+
+    posture = classify_posture(keypoints, side_ratio=side_ratio)
+    details.update(posture)
+    covered = posture["posture"] in {"side", "face_down"}
+    observed.update(
+        {
+            "no_person": False,
+            "face_cover_rollover": covered,
+            "boundary": safe_zone_detection_status(zone_status, latest)["triggered"],
+        }
+    )
+    return observed, "covered" if covered else "visible", details
 
 
 def vision_safety_status(latest: dict[str, Any] | None) -> dict[str, Any]:
@@ -401,17 +468,17 @@ class AppRuntime:
         self.resources = ResourceMonitor()
         self.activity_zone_store = ActivityZoneStore(ACTIVITY_ZONE_FILE)
         self.care = CareStore(CARE_RECORDS_FILE, CARE_PROFILE_FILE)
-        self.events = EventLog(EVENT_LOG_FILE)
-        assistant_settings = load_assistant_settings()
+        self.events = EventLog(CARE_EVENTS_FILE)
+        self.side_shoulder_ratio = load_side_shoulder_ratio()
+        self._event_stop = threading.Event()
+        self._event_thread: threading.Thread | None = None
         self.assistant = ChatAssistant(
-            assistant_settings,
+            load_assistant_settings(),
             overview=self.care.overview,
             room=self.hardware.temperature_humidity.status,
             pauser=WorkloadPauser(vision=self.video.vision),
-            events=lambda: self.events.summary(window_s=assistant_settings.event_window_s),
+            events=self.events.summary,
         )
-        self._event_stop = threading.Event()
-        self._event_thread: threading.Thread | None = None
         self.started_at = time.time()
         self.status_aggregator = StatusAggregator(
             config=config,
@@ -435,59 +502,35 @@ class AppRuntime:
     def start(self) -> None:
         self.video.start()
         self.audio.start()
-        self._event_stop.clear()
-        self._event_thread = threading.Thread(target=self._watch_events, name="event-log", daemon=True)
-        self._event_thread.start()
+        if self._event_thread is None or not self._event_thread.is_alive():
+            self._event_stop.clear()
+            self._event_thread = threading.Thread(target=self._watch_events, name="event-log", daemon=True)
+            self._event_thread.start()
 
     def stop(self) -> None:
         self._event_stop.set()
-        if self._event_thread is not None:
-            self._event_thread.join(timeout=2.0)
         self.hardware.close()
         self.audio.stop()
         self.video.stop()
 
-    # ---------------------------------------------------------------- event log
-
-    def event_inputs(self, now: float | None = None) -> tuple[dict[str, bool | None], str, dict[str, dict[str, Any]]]:
-        """Current state of each event type for EventLog.observe (None = unknown right now)."""
-        now = time.time() if now is None else now
-        active: dict[str, bool | None] = {"face_cover_rollover": None, "no_person": None, "boundary": None, "cry": None}
-        details: dict[str, dict[str, Any]] = {}
-        latest = self.vision.latest_result()
-        updated_at = latest.get("updated_at") if isinstance(latest, dict) else None
-        if self.vision.paused:
-            vision_state = "paused"  # LLM is answering: keep vision episodes as they are
-        elif updated_at is None:
-            vision_state = "unknown"  # camera off or no pose result yet
-        elif now - float(updated_at) > EVENT_INPUT_MAX_AGE_S:
-            vision_state = "stale"
-        else:
-            safety = vision_safety_status(latest)
-            zone = safe_zone_detection_status(self.activity_zone_store.status(), latest)
-            active["no_person"] = bool(safety.get("no_person"))
-            active["face_cover_rollover"] = bool(safety.get("face_cover_rollover"))
-            active["boundary"] = bool(zone.get("triggered"))
-            vision_state = "no_person" if active["no_person"] else "covered" if active["face_cover_rollover"] else "visible"
-        yamnet = self.audio.latest_yamnet
-        if isinstance(yamnet, dict) and yamnet.get("status") == "ok" and yamnet.get("updated_at") is not None:
-            if now - float(yamnet["updated_at"]) <= EVENT_INPUT_MAX_AGE_S:
-                active["cry"] = yamnet.get("crying") is True
-                if active["cry"]:
-                    details["cry"] = {"score": yamnet.get("cry_score")}
-        return active, vision_state, details
-
-    def observe_events(self, now: float | None = None) -> list[dict[str, Any]]:
-        active, vision_state, details = self.event_inputs(now)
-        return self.events.observe(active, now=now, vision_state=vision_state, details=details)
-
     def _watch_events(self) -> None:
-        while not self._event_stop.is_set():
+        while not self._event_stop.wait(EVENT_SAMPLE_S):
             try:
-                self.observe_events()
-            except Exception as exc:  # never let the event log take the service down
-                print(f"[event-log] {exc}", flush=True)
-            self._event_stop.wait(EVENT_WATCH_INTERVAL_S)
+                self.sample_events()
+            except Exception as exc:  # never take the main service down
+                print(f"[event-log] sample failed: {exc}", flush=True)
+
+    def sample_events(self, now: float | None = None) -> None:
+        now = time.time() if now is None else now
+        observed, vision_state, details = event_inputs(
+            self.vision.status(),
+            bool(self.camera.status().get("running")),
+            self.audio.latest_yamnet,
+            self.activity_zone_store.status(),
+            now,
+            side_ratio=self.side_shoulder_ratio,
+        )
+        self.events.observe(observed, now=now, vision_state=vision_state, details=details)
 
     def status(self) -> dict[str, Any]:
         return self.status_aggregator.status()

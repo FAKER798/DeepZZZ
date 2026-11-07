@@ -5,165 +5,205 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from services.event_log import EventLog, EventLogError
+from services.event_log import EventLog, EventLogError, classify_posture
 
-T0 = 1_790_000_000.0
+FACE = "face_cover_rollover"
+
+
+def kp(points: dict[int, tuple[float, float]], conf: float = 0.9) -> list[list[float]]:
+    """17 COCO keypoints; only the given indexes are visible."""
+    out = [[0.0, 0.0, 0.0] for _ in range(17)]
+    for index, (x, y) in points.items():
+        out[index] = [x, y, conf]
+    return out
+
+
+# Top-down view, head at the top: shoulders 40 px apart, hips 50 px below.
+BACK = kp({0: (100, 40), 1: (95, 35), 2: (105, 35), 5: (80, 60), 6: (120, 60), 11: (88, 110), 12: (112, 110)})
+SIDE = kp({0: (100, 40), 1: (96, 35), 5: (99, 58), 6: (103, 64), 11: (98, 110), 12: (102, 112)})
+FACE_DOWN = kp({3: (95, 40), 5: (80, 60), 6: (120, 60), 11: (88, 110), 12: (112, 110)})
 
 
 class Clock:
-    def __init__(self) -> None:
-        self.now = T0
+    def __init__(self, now: float = 1_800_000_000.0) -> None:
+        self.now = now
 
     def __call__(self) -> float:
         return self.now
 
 
-def feed(log: EventLog, clock: Clock, seconds: int, **active) -> list[dict]:
-    """One sample per second for `seconds` seconds; returns all changes."""
-    changes = []
-    for _ in range(seconds):
-        changes += log.observe({name: active.get(name) for name in ("cry", "face_cover_rollover", "boundary", "no_person")},
-                               now=clock.now, vision_state=active.get("vision_state", "visible"))
-        clock.now += 1.0
-    return changes
+class EventLogCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "events.json"
+        self.clock = Clock()
+        self.log = EventLog(self.path, clock=self.clock)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def feed(self, seconds: int, face: bool | None = False, cry: bool | None = False, **details) -> None:
+        """One sample per second, like the main service."""
+        for _ in range(seconds):
+            self.log.observe({FACE: face, "cry": cry, "boundary": False, "no_person": False},
+                             now=self.clock.now, vision_state="covered" if face else "visible", details=details)
+            self.clock.now += 1
+
+    def stored(self) -> list[dict]:
+        return json.loads(self.path.read_text(encoding="utf-8"))["events"]
 
 
-def make_log(tmp: str) -> tuple[EventLog, Clock, Path]:
-    clock = Clock()
-    path = Path(tmp) / "events.json"
-    return EventLog(path, clock=clock), clock, path
+class DebounceTests(EventLogCase):
+    def test_single_frame_flicker_is_not_logged(self) -> None:
+        self.feed(5)
+        self.feed(1, face=True)
+        self.feed(10)
+        self.assertEqual(self.log.list_events(), [])
+
+    def test_starts_after_2s_at_first_true_and_ends_after_5s_at_last_true(self) -> None:
+        self.feed(3)
+        first_true = self.clock.now
+        self.feed(2, face=True)
+        self.assertEqual(self.log.list_events(), [])  # 1 s of True so far, not 2
+        self.feed(1, face=True)
+        events = self.log.list_events()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["start_at"], first_true)
+        self.assertTrue(events[0]["ongoing"])
+        self.assertEqual(events[0]["id"], f"{FACE}-{int(first_true * 1000)}")
+        last_true = self.clock.now
+        self.feed(1, face=True)
+        self.feed(5)  # 4 s of False after the last True: still ongoing
+        self.assertTrue(self.log.list_events()[0]["ongoing"])
+        self.feed(1)
+        event = self.log.list_events()[0]
+        self.assertFalse(event["ongoing"])
+        self.assertEqual(event["end_at"], last_true)
+        self.assertEqual(event["duration_s"], last_true - first_true)
+        self.assertEqual(self.stored()[0]["end_at"], last_true)
+
+    def test_cry_starts_at_once_and_keeps_peak_score(self) -> None:
+        self.feed(1, cry=True, cry_score=0.5)
+        self.feed(1, cry=True, cry_score=0.82)
+        self.feed(1, cry=True, cry_score=0.6)
+        self.feed(4)
+        event = self.log.list_events(event_type="cry")[0]
+        self.assertEqual(event["peak_score"], 0.82)
+        self.assertFalse(event["ongoing"])
+
+    def test_rolling_back_and_forth_within_30s_is_one_event(self) -> None:
+        self.feed(3, face=True)
+        self.feed(10)  # ended
+        self.assertFalse(self.log.list_events()[0]["ongoing"])
+        self.feed(3, face=True)  # back within 30 s of the end
+        events = self.log.list_events()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["merged"], 1)
+        self.assertTrue(events[0]["ongoing"])
+        self.feed(40)
+        self.feed(3, face=True)  # more than 30 s later: a new event
+        self.assertEqual(len(self.log.list_events()), 2)
 
 
-class EpisodeTests(unittest.TestCase):
-    def test_face_cover_needs_two_seconds_and_closes_after_five(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            log, clock, _ = make_log(tmp)
-            feed(log, clock, 3, face_cover_rollover=False)
-            # a single-frame blip is not an episode
-            self.assertEqual(feed(log, clock, 1, face_cover_rollover=True), [])
-            feed(log, clock, 1, face_cover_rollover=False)
-            self.assertEqual(log.list_events(), [])
-            start = clock.now
-            opened = feed(log, clock, 10, face_cover_rollover=True)
-            self.assertEqual(len(opened), 1)
-            self.assertEqual(opened[0]["start_at"], start)  # starts at the first true sample, not after the 2 s wait
-            self.assertTrue(opened[0]["ongoing"])
-            last_true = clock.now - 1
-            closed = feed(log, clock, 6, face_cover_rollover=False)
-            self.assertEqual(len(closed), 1)
-            event = log.list_events()[0]
-            self.assertFalse(event["ongoing"])
-            self.assertEqual(event["end_at"], last_true)
-            self.assertEqual(event["duration_s"], 9.0)
-            self.assertEqual(event["source"], "vision")
+class UnknownAndRestartTests(EventLogCase):
+    def test_unknown_input_keeps_event_then_interrupts_after_120s(self) -> None:
+        self.feed(3, face=True)
+        last_true = self.clock.now - 1
+        self.feed(60, face=None)
+        self.assertTrue(self.log.list_events()[0]["ongoing"])  # unknown never ends an event
+        self.feed(61, face=None)
+        event = self.log.list_events()[0]
+        self.assertFalse(event["ongoing"])
+        self.assertTrue(event["interrupted"])
+        self.assertEqual(event["end_at"], last_true)
 
-    def test_cry_opens_at_once_and_keeps_peak_score(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            log, clock, _ = make_log(tmp)
-            for score in (0.5, 0.9, 0.7):
-                log.observe({"cry": True}, now=clock.now, details={"cry": {"score": score}})
-                clock.now += 1
-            feed(log, clock, 4, cry=False)
-            event = log.list_events(event_type="cry")[0]
-            self.assertEqual(event["source"], "yamnet")
-            self.assertEqual(event["peak_score"], 0.9)
-            self.assertEqual(event["duration_s"], 2.0)
+    def test_unknown_input_never_starts_an_event(self) -> None:
+        self.feed(1, face=True)
+        self.feed(5, face=None)
+        self.feed(1, face=True)
+        self.assertEqual(self.log.list_events(), [])
 
-    def test_episode_within_30s_is_merged(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            log, clock, _ = make_log(tmp)
-            feed(log, clock, 5, cry=True)
-            feed(log, clock, 20, cry=False)  # closed after 3 s, then 17 s quiet
-            feed(log, clock, 5, cry=True)
-            events = log.list_events(event_type="cry")
-            self.assertEqual(len(events), 1)
-            self.assertTrue(events[0]["ongoing"])
-            self.assertEqual(events[0]["merged"], 1)
-            feed(log, clock, 60, cry=False)
-            feed(log, clock, 3, cry=True)
-            self.assertEqual(len(log.list_events(event_type="cry")), 2)
+    def test_restart_closes_ongoing_events_at_last_seen(self) -> None:
+        self.feed(5, face=True)
+        last_seen = self.stored()[0]["last_seen_at"]  # flushed on start, then every 30 s
+        reopened = EventLog(self.path, clock=self.clock)
+        event = reopened.list_events()[0]
+        self.assertFalse(event["ongoing"])
+        self.assertTrue(event["interrupted"])
+        self.assertEqual(event["end_at"], last_seen)
 
-    def test_unknown_keeps_episode_then_closes_as_interrupted(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            log, clock, _ = make_log(tmp)
-            feed(log, clock, 5, face_cover_rollover=True)
-            last_true = clock.now - 1
-            # LLM answering for 60 s: YOLO paused, inputs unknown -> episode stays open
-            self.assertEqual(feed(log, clock, 60, vision_state="paused"), [])
-            self.assertTrue(log.list_events()[0]["ongoing"])
-            # camera gone for good -> closed at the last true sample
-            closed = feed(log, clock, 70, vision_state="unknown")
-            self.assertEqual(len(closed), 1)
-            event = log.list_events()[0]
-            self.assertTrue(event["interrupted"])
-            self.assertEqual(event["end_at"], last_true)
-
-    def test_restart_closes_open_episode_and_persists(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            log, clock, path = make_log(tmp)
-            feed(log, clock, 40, no_person=True)  # opens after 5 s, rewritten every 30 s while open
-            saved = json.loads(path.read_text(encoding="utf-8"))
-            self.assertIsNone(saved["events"][0]["end_at"])
-            again = EventLog(path, clock=clock)
-            event = again.list_events()[0]
-            self.assertFalse(event["ongoing"])
-            self.assertTrue(event["interrupted"])
-            self.assertGreaterEqual(event["end_at"], event["start_at"])
-
-    def test_old_events_are_dropped(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            log, clock, path = make_log(tmp)
-            feed(log, clock, 5, cry=True)
-            feed(log, clock, 5, cry=False)
-            clock.now += 8 * 86400
-            feed(log, clock, 5, cry=True)
-            self.assertEqual(len(json.loads(path.read_text(encoding="utf-8"))["events"]), 1)
+    def test_events_older_than_7_days_are_dropped(self) -> None:
+        self.feed(3, face=True)
+        self.feed(10)
+        self.clock.now += 8 * 86400
+        self.feed(1, cry=True)  # any write prunes
+        self.assertEqual([e["type"] for e in self.stored()], ["cry"])
 
 
-class QueryTests(unittest.TestCase):
-    def test_summary_counts_window_and_current_state(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            log, clock, _ = make_log(tmp)
-            feed(log, clock, 10, cry=True)
-            feed(log, clock, 100, cry=False)
-            feed(log, clock, 10, cry=True)
-            feed(log, clock, 100, cry=False)
-            feed(log, clock, 6, face_cover_rollover=True, vision_state="covered")
-            summary = log.summary(window_s=3600)
-            self.assertEqual(summary["types"]["cry"]["count"], 2)
-            self.assertEqual(summary["types"]["cry"]["total_s"], 18.0)
-            self.assertEqual(summary["types"]["face_cover_rollover"]["count"], 1)
-            self.assertTrue(summary["types"]["face_cover_rollover"]["latest"]["ongoing"])
-            self.assertEqual(summary["types"]["boundary"]["count"], 0)
-            self.assertEqual(summary["current"]["vision_state"], "covered")
-            self.assertEqual(summary["current"]["active"], ["face_cover_rollover"])
-            # a 60 s window only sees the ongoing episode
-            self.assertEqual(log.summary(window_s=60)["types"]["cry"]["count"], 0)
-            # nothing observed for a while -> camera state unknown
-            clock.now += 30
-            self.assertEqual(log.summary()["current"]["vision_state"], "unknown")
+class PostureTests(EventLogCase):
+    def test_classify_posture(self) -> None:
+        self.assertEqual(classify_posture(BACK)["posture"], "back")
+        self.assertEqual(classify_posture(SIDE)["posture"], "side")
+        self.assertEqual(classify_posture(FACE_DOWN)["posture"], "face_down")
+        self.assertEqual(classify_posture(SIDE, side_ratio=0)["posture"], "back")  # side detection off
+        hidden_body = kp({0: (100, 40), 1: (96, 35)})
+        self.assertEqual(classify_posture(hidden_body), {"posture": "back", "shoulder_ratio": None})
 
-    def test_list_filters_and_millisecond_times(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            log, clock, _ = make_log(tmp)
-            feed(log, clock, 5, cry=True)
-            feed(log, clock, 60, cry=False)
-            middle = clock.now
-            feed(log, clock, 5, boundary=True)
-            feed(log, clock, 10, boundary=False)
-            self.assertEqual([e["type"] for e in log.list_events()], ["boundary", "cry"])
-            self.assertEqual([e["type"] for e in log.list_events(since=int(middle * 1000))], ["boundary"])
-            self.assertEqual([e["type"] for e in log.list_events(until=middle - 1)], ["cry"])
-            self.assertEqual(len(log.list_events(limit="1")), 1)
+    def test_roll_from_back_to_side_is_one_event_with_posture(self) -> None:
+        self.feed(10, posture="back")
+        self.feed(4, face=True, posture="side")
+        event = self.log.list_events()[0]
+        self.assertEqual((event["type"], event["posture"], event["from_posture"]), (FACE, "side", "back"))
+        summary = self.log.summary(600)
+        self.assertEqual(summary["types"][FACE]["side_count"], 1)
+        self.assertEqual(summary["current"]["posture"], "side")
+
+    def test_face_already_hidden_at_start_has_no_from_posture(self) -> None:
+        self.feed(4, face=True, posture="face_down")
+        self.assertNotIn("from_posture", self.log.list_events()[0])
+
+
+class QueryTests(EventLogCase):
+    def test_summary_counts_and_current_state(self) -> None:
+        self.feed(5, cry=True, cry_score=0.7)
+        self.feed(10)
+        self.feed(4, face=True)
+        summary = self.log.summary(window_s=600)
+        self.assertEqual(summary["types"]["cry"]["count"], 1)
+        self.assertEqual(summary["types"]["cry"]["total_s"], 4.0)
+        self.assertEqual(summary["types"][FACE]["latest"]["ongoing"], True)
+        self.assertEqual(summary["current"]["vision_state"], "covered")
+        self.assertEqual(summary["current"]["active"], [FACE])
+        self.assertEqual(summary["types"]["boundary"], {"count": 0, "total_s": 0, "latest": None})
+        self.clock.now += 11  # no sample for >10 s
+        self.assertEqual(self.log.summary()["current"]["vision_state"], "unknown")
+        with self.assertRaises(EventLogError) as caught:
+            self.log.summary(window_s=5)
+        self.assertEqual(str(caught.exception), "window_s must be between 60 and 604800")
+
+    def test_list_filters_newest_first_and_accepts_ms(self) -> None:
+        self.feed(5, cry=True)
+        self.feed(10)
+        middle = self.clock.now
+        self.feed(4, face=True)
+        events = self.log.list_events()
+        self.assertEqual([e["type"] for e in events], [FACE, "cry"])
+        self.assertEqual([e["type"] for e in self.log.list_events(since=int(middle * 1000))], [FACE])
+        self.assertEqual([e["type"] for e in self.log.list_events(until=middle - 1)], ["cry"])
+        self.assertEqual(len(self.log.list_events(limit="1")), 1)
 
     def test_bad_parameters(self) -> None:
-        log = EventLog(None, clock=Clock())
-        for kwargs in ({"event_type": "sneeze"}, {"limit": "0"}, {"limit": "x"}, {"since": "yesterday"}):
-            with self.assertRaises(EventLogError):
-                log.list_events(**kwargs)
-        for window in ("abc", 10, 30 * 86400):
-            with self.assertRaises(EventLogError):
-                log.summary(window_s=window)
+        cases = [
+            ({"event_type": "sneeze"}, "type must be one of cry, face_cover_rollover, boundary, no_person"),
+            ({"limit": "x"}, "limit must be an integer"),
+            ({"limit": "0"}, "limit must be at least 1"),
+            ({"since": "abc"}, "since must be a number"),
+            ({"until": "-5"}, "until must be a non-negative number"),
+        ]
+        for kwargs, message in cases:
+            with self.subTest(kwargs=kwargs), self.assertRaises(EventLogError) as caught:
+                self.log.list_events(**kwargs)
+            self.assertEqual(str(caught.exception), message)
 
 
 if __name__ == "__main__":

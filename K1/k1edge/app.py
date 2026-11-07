@@ -110,6 +110,29 @@ def create_main_app(runtime: AppRuntime) -> Flask:
             return error("body must be {\"enabled\": true|false}", HTTPStatus.BAD_REQUEST)
         return ok({"result": runtime.set_voice_trigger_enabled(body["enabled"])})
 
+    # ---- vision / cry events (naviga app 「AI 问答」 page, LLM context)
+    @app.errorhandler(EventLogError)
+    def handle_event_error(exc: EventLogError):
+        return error(str(exc), HTTPStatus.BAD_REQUEST)
+
+    @app.get("/api/events")
+    def events():
+        args = request.args
+        return ok(
+            {
+                "result": runtime.events.list_events(
+                    since=args.get("since"),
+                    until=args.get("until"),
+                    event_type=args.get("type"),
+                    limit=args.get("limit"),
+                )
+            }
+        )
+
+    @app.get("/api/events/summary")
+    def events_summary():
+        return ok({"result": runtime.events.summary(request.args.get("window_s"))})
+
     # ---- baby care records (naviga app Care page + voice worker)
     @app.errorhandler(CareError)
     def handle_care_error(exc: CareError):
@@ -161,29 +184,6 @@ def create_main_app(runtime: AppRuntime) -> Flask:
     @app.route("/api/care/profile", methods=["POST", "PUT", "PATCH"])
     def save_care_profile():
         return ok({"result": runtime.care.save_profile(request_json())})
-
-    # ---- vision / sound episodes (naviga app; also summarised into the AI Q&A context)
-    @app.errorhandler(EventLogError)
-    def handle_event_log_error(exc: EventLogError):
-        return error(str(exc), exc.status)
-
-    @app.get("/api/events")
-    def events():
-        args = request.args
-        return ok(
-            {
-                "result": runtime.events.list_events(
-                    since=args.get("since"),
-                    until=args.get("until"),
-                    event_type=args.get("type"),
-                    limit=args.get("limit"),
-                )
-            }
-        )
-
-    @app.get("/api/events/summary")
-    def events_summary():
-        return ok({"result": runtime.events.summary(window_s=request.args.get("window_s", 7200))})
 
     # ---- AI Q&A (naviga app): local Ollama model, YOLO + ASR paused while it answers
     @app.errorhandler(AssistantError)
