@@ -22,6 +22,9 @@ pre-audio-playback-working-tree*.txt
 # Office lock files
 ~$*
 
+# Word versions of the docs are submitted on the competition platform, not tracked here
+docs/*.docx
+
 # OS / editor
 .DS_Store
 Thumbs.db
