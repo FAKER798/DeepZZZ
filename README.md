@@ -41,6 +41,10 @@ DeepZZZ/
 
 ## 快速开始
 
+```bash
+git clone https://github.com/FAKER798/DeepZZZ.git
+```
+
 ### 板端（K1 MUSE Pi Pro，Bianbu OS）
 
 ```bash
