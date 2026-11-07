@@ -99,6 +99,7 @@ python -m unittest discover -s tests -t . -v
 
 - [方案书](docs/方案书.md)
 - [技术文档](docs/技术文档.md)：优化策略、部署说明、用户文档、接口说明、测试报告
+- [视觉/声音事件接口文档](docs/接口文档.md)：`/api/events`、`/api/events/summary` 与 AI 问答上下文中的视觉信息
 - 板端架构细节：[K1/架构说明.md](K1/架构说明.md)、[K1/自启情况.md](K1/自启情况.md)
 - 演示视频：待上传后补充链接
 

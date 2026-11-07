@@ -13,6 +13,7 @@ from k1edge.config import EdgeConfig, parse_config
 from k1edge.runtime import AppRuntime
 from services.care_log import CareError
 from services.chat_assistant import AssistantError
+from services.event_log import EventLogError
 from utils.paths import AUDIO_DIR, DATASET_DIR, LULLABY_DIR, STATIC_DIR, TEMPLATES_DIR, ensure_runtime_dirs
 
 
@@ -160,6 +161,29 @@ def create_main_app(runtime: AppRuntime) -> Flask:
     @app.route("/api/care/profile", methods=["POST", "PUT", "PATCH"])
     def save_care_profile():
         return ok({"result": runtime.care.save_profile(request_json())})
+
+    # ---- vision / sound episodes (naviga app; also summarised into the AI Q&A context)
+    @app.errorhandler(EventLogError)
+    def handle_event_log_error(exc: EventLogError):
+        return error(str(exc), exc.status)
+
+    @app.get("/api/events")
+    def events():
+        args = request.args
+        return ok(
+            {
+                "result": runtime.events.list_events(
+                    since=args.get("since"),
+                    until=args.get("until"),
+                    event_type=args.get("type"),
+                    limit=args.get("limit"),
+                )
+            }
+        )
+
+    @app.get("/api/events/summary")
+    def events_summary():
+        return ok({"result": runtime.events.summary(window_s=request.args.get("window_s", 7200))})
 
     # ---- AI Q&A (naviga app): local Ollama model, YOLO + ASR paused while it answers
     @app.errorhandler(AssistantError)

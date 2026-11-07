@@ -7,6 +7,9 @@ The phone sends the conversation, the board answers with the local Ollama model
     {"type": "delta", "text": "..."}            (repeated)
     {"type": "done", "reply": "...", ...}       or {"type": "error", "code": ..., "error": "<中文>"}
 
+The context also carries the vision / cry episodes of the last 2 hours and the current
+camera state (services/event_log.py), shown in the app as a "画面：… · 近 2 小时哭闹 N 次" tag.
+
 While a reply is being generated the pose model (YOLO, CPU0-3) and the voice
 care-log worker (ASR, CPU0-3) are paused so the LLM gets those cores; both are
 resumed as soon as the reply ends, fails or the phone disconnects.
@@ -65,6 +68,7 @@ class AssistantSettings:
     history_chars: int = 1600
     pause_vision: bool = True
     pause_voice: bool = True
+    event_window_s: float = 7200.0  # vision / cry episodes from the last 2 h go into the context
     request_timeout_s: float = 140.0  # app gives up after 150 s without a line
     health_timeout_s: float = 1.0
     health_cache_s: float = 5.0
@@ -251,7 +255,71 @@ def feeding_text(record: dict[str, Any]) -> str:
     return " ".join(parts)
 
 
-def build_context(overview: dict[str, Any] | None, room: dict[str, Any] | None) -> tuple[str, list[str]]:
+EVENT_ORDER = ("cry", "face_cover_rollover", "boundary", "no_person")
+EVENT_TEXT = {"cry": "哭闹", "face_cover_rollover": "遮脸/翻身", "boundary": "越出安全区域", "no_person": "离开画面"}
+VISION_LINE = {
+    "visible": "摄像头当前画面：检测到宝宝，面部可见。",
+    "covered": "摄像头当前画面：疑似遮脸或趴睡（鼻子和眼睛关键点都看不到），回答时先提醒家长立即查看宝宝。",
+    "no_person": "摄像头当前画面：没有检测到宝宝。",
+}
+VISION_FACT = {"visible": "面部可见", "covered": "疑似遮脸/翻身", "no_person": "画面无人"}
+
+
+def _duration_text(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    return f"{int(round(seconds))} 秒" if seconds < 60 else _minutes_text(seconds / 60)
+
+
+def _window_text(window_s: float) -> str:
+    window_s = float(window_s)
+    if window_s >= 3600 and window_s % 3600 == 0:
+        return f"{int(window_s // 3600)} 小时"
+    return _minutes_text(window_s / 60)
+
+
+def event_context(events: dict[str, Any] | None) -> tuple[list[str], list[str]]:
+    """Prompt lines and one app fact tag from EventLog.summary()."""
+    if not isinstance(events, dict) or not isinstance(events.get("types"), dict):
+        return [], []
+    types = events["types"]
+    window = _window_text(events.get("window_s") or 7200)
+    lines: list[str] = []
+    state = str((events.get("current") or {}).get("vision_state") or "")
+    if state in VISION_LINE:
+        lines.append(VISION_LINE[state])
+    items = []
+    for name in EVENT_ORDER:
+        info = types.get(name) or {}
+        count = int(info.get("count") or 0)
+        if not count:
+            continue
+        latest = info.get("latest") or {}
+        detail = ""
+        start = _clock_text(latest.get("start_at"))
+        if start:
+            if latest.get("ongoing"):
+                detail = f"（最近一次 {start} 开始，仍在持续）"
+            else:
+                detail = f"（最近一次 {start} 开始，持续 {_duration_text(latest.get('duration_s') or 0)}）"
+        items.append(f"{EVENT_TEXT[name]} {count} 次{detail}")
+    summary = "；".join(items) if items else "没有哭闹、遮脸/翻身、越界或离开画面的记录"
+    lines.append(f"最近 {window}摄像头和麦克风的自动监测（可能有误报）：{summary}。")
+    tag = []
+    if state in VISION_FACT:
+        tag.append(f"画面：{VISION_FACT[state]}")
+    count = lambda name: int((types.get(name) or {}).get("count") or 0)  # noqa: E731
+    tag.append(f"近 {window}哭闹 {count('cry')} 次")
+    tag.append(f"遮脸/翻身 {count('face_cover_rollover')} 次")
+    if count("boundary"):
+        tag.append(f"越界 {count('boundary')} 次")
+    return lines, [" · ".join(tag)]
+
+
+def build_context(
+    overview: dict[str, Any] | None,
+    room: dict[str, Any] | None,
+    events: dict[str, Any] | None = None,
+) -> tuple[str, list[str]]:
     """Device records for the prompt, plus the short "facts" tags shown in the app."""
     lines: list[str] = []
     facts: list[str] = []
@@ -307,6 +375,10 @@ def build_context(overview: dict[str, Any] | None, room: dict[str, Any] | None) 
             window = f"，按记录预测建议在 {_clock_text(nap['earliest_at'])}-{_clock_text(nap['latest_at'])} 之间小睡"
         lines.append(f"宝宝已清醒 {awake}{window}。")
 
+    event_lines, event_facts = event_context(events)
+    lines.extend(event_lines)
+    facts.extend(event_facts)
+
     room = room or {}
     temp, humidity = room.get("temperature_c"), room.get("humidity_percent")
     age_s = room.get("age_s")
@@ -325,12 +397,14 @@ class ChatAssistant:
         overview: Callable[[], dict[str, Any]] | None = None,
         room: Callable[[], dict[str, Any]] | None = None,
         pauser: WorkloadPauser | None = None,
+        events: Callable[[], dict[str, Any]] | None = None,
         client: OllamaClient | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self.settings = settings or AssistantSettings()
         self.overview = overview or (lambda: {})
         self.room = room or (lambda: {})
+        self.events = events or (lambda: {})
         self.pauser = pauser or WorkloadPauser(voice_pause_path=None)
         self.client = client or OllamaClient(self.settings.ollama_url)
         self.clock = clock
@@ -382,7 +456,11 @@ class ChatAssistant:
             room = self.room()
         except Exception:
             room = {}
-        context, facts = build_context(overview, room)
+        try:
+            events = self.events()
+        except Exception:
+            events = {}
+        context, facts = build_context(overview, room, events)
         system = f"{SYSTEM_PROMPT}\n\n下面是看护设备记录的情况，回答时可以参考：\n{context}"
         history = messages[-(2 * max(0, self.settings.history_turns) + 1):]
         return [{"role": "system", "content": system}, *trim_history(history, self.settings.history_chars)], facts

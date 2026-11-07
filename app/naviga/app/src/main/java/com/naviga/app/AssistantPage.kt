@@ -35,6 +35,7 @@ import androidx.compose.material.icons.rounded.AutoAwesome
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Stop
 import androidx.compose.material.icons.rounded.Tune
+import androidx.compose.material.icons.rounded.Videocam
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.Icon
@@ -65,7 +66,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
+private const val EVENT_WINDOW_SECONDS = 7200
+
 private val SUGGESTED_QUESTIONS = listOf(
+    "宝宝刚才睡得怎么样？",
     "宝宝现在该小睡了吗？",
     "今天的奶量够不够？",
     "现在的室温适合宝宝睡觉吗？",
@@ -101,6 +105,11 @@ class AssistantChatState(private val boardApi: BoardApi, private val scope: Coro
         private set
     var statusChecked by mutableStateOf(false)
         private set
+    /** Camera / cry observations the board will put into the next answer's context. */
+    var events by mutableStateOf<BoardEventSummary?>(null)
+        private set
+    var recentEvents by mutableStateOf<List<BoardEvent>>(emptyList())
+        private set
 
     private var nextId = 0L
     private var cancelSignal: AssistantCancelSignal? = null
@@ -110,6 +119,20 @@ class AssistantChatState(private val boardApi: BoardApi, private val scope: Coro
             val latest = withContext(Dispatchers.IO) { boardApi.assistantStatus() }
             status = latest
             statusChecked = true
+        }
+        refreshEvents()
+    }
+
+    fun refreshEvents() {
+        scope.launch {
+            val (summary, recent) = withContext(Dispatchers.IO) {
+                val summary = boardApi.eventSummary(EVENT_WINDOW_SECONDS)
+                val since = System.currentTimeMillis() - EVENT_WINDOW_SECONDS * 1000L
+                val recent = if (summary != null) boardApi.events(sinceMillis = since, limit = 3).orEmpty() else emptyList()
+                summary to recent
+            }
+            events = summary
+            recentEvents = recent
         }
     }
 
@@ -240,7 +263,12 @@ fun AssistantPage(state: AssistantChatState) {
         )
         Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
             if (state.messages.isEmpty()) {
-                EmptyAssistant(enabled = !state.answering, onAsk = ::submit)
+                EmptyAssistant(
+                    enabled = !state.answering,
+                    onAsk = ::submit,
+                    events = state.events,
+                    recentEvents = state.recentEvents,
+                )
             } else {
                 LazyColumn(
                     state = listState,
@@ -306,7 +334,12 @@ private fun AssistantHeader(state: AssistantChatState, onNewChat: () -> Unit, mo
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun EmptyAssistant(enabled: Boolean, onAsk: (String) -> Unit) {
+private fun EmptyAssistant(
+    enabled: Boolean,
+    onAsk: (String) -> Unit,
+    events: BoardEventSummary?,
+    recentEvents: List<BoardEvent>,
+) {
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -326,11 +359,12 @@ private fun EmptyAssistant(enabled: Boolean, onAsk: (String) -> Unit) {
             Spacer(Modifier.size(10.dp))
             Text(
                 text = "问喂养、睡眠、护理的问题。回答由看护设备上的本地小模型生成，" +
-                    "会参考宝宝月龄、今天的记录和房间温湿度，数据不出家门。",
+                    "会参考宝宝月龄、今天的记录、摄像头和哭声检测的观察，以及房间温湿度，数据不出家门。",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
+        if (events != null) EventObservationCard(events, recentEvents)
         Text("可以这样问", style = MaterialTheme.typography.titleMedium)
         FlowRow(
             horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -429,14 +463,105 @@ private fun AnswerBubble(message: AssistantMessage, onRetry: () -> Unit, retryEn
     }
 }
 
+/** The board's camera / cry fact starts with "画面：" or "近 N 小时哭闹" (services/chat_assistant.py event_context). */
+private fun isVisionFact(text: String): Boolean = text.startsWith("画面：") || (text.startsWith("近 ") && "哭闹" in text)
+
 @Composable
 private fun FactTag(text: String) {
+    val vision = isVisionFact(text)
+    val alarming = vision && "疑似遮脸" in text
+    val colors = MaterialTheme.colorScheme
     Surface(
-        color = MaterialTheme.colorScheme.secondaryContainer,
-        contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+        color = when {
+            alarming -> colors.errorContainer
+            vision -> colors.tertiaryContainer
+            else -> colors.secondaryContainer
+        },
+        contentColor = when {
+            alarming -> colors.onErrorContainer
+            vision -> colors.onTertiaryContainer
+            else -> colors.onSecondaryContainer
+        },
         shape = RoundedCornerShape(8.dp),
     ) {
-        Text(text, style = MaterialTheme.typography.labelMedium, modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp))
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+        ) {
+            if (vision) {
+                Icon(Icons.Rounded.Videocam, contentDescription = "摄像头与哭声检测", modifier = Modifier.size(14.dp))
+                Spacer(Modifier.size(4.dp))
+            }
+            Text(text, style = MaterialTheme.typography.labelMedium)
+        }
+    }
+}
+
+private fun windowText(seconds: Double): String {
+    val minutes = (seconds / 60).toInt()
+    return if (minutes % 60 == 0) "${minutes / 60} 小时" else "$minutes 分钟"
+}
+
+/** What the camera and cry detector saw recently: the same summary the local model will read. */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun EventObservationCard(events: BoardEventSummary, recentEvents: List<BoardEvent>) {
+    val colors = MaterialTheme.colorScheme
+    PressedCard(contentPadding = PaddingValues(16.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Rounded.Videocam, contentDescription = null, tint = colors.tertiary, modifier = Modifier.size(20.dp))
+            Text(
+                text = "设备观察 · 近 ${windowText(events.windowSeconds)}",
+                style = MaterialTheme.typography.titleMedium,
+                modifier = Modifier.padding(start = 8.dp),
+            )
+        }
+        Spacer(Modifier.size(6.dp))
+        val stateLabel = events.visionState.label
+        Text(
+            text = if (stateLabel != null) "当前画面：$stateLabel" else "当前画面：暂无实时结果",
+            style = MaterialTheme.typography.bodyMedium,
+            color = if (events.visionState == VisionState.Covered) colors.error else colors.onSurfaceVariant,
+        )
+        Spacer(Modifier.size(8.dp))
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            BoardEventType.entries.forEach { type ->
+                val count = events.count(type)
+                Surface(
+                    color = if (count > 0) colors.tertiaryContainer else colors.surfaceVariant,
+                    contentColor = if (count > 0) colors.onTertiaryContainer else colors.onSurfaceVariant,
+                    shape = RoundedCornerShape(8.dp),
+                ) {
+                    Text(
+                        text = "${type.label} $count 次",
+                        style = MaterialTheme.typography.labelMedium,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                    )
+                }
+            }
+        }
+        if (recentEvents.isNotEmpty()) {
+            Spacer(Modifier.size(8.dp))
+            recentEvents.forEach { event ->
+                val clock = String.format(Locale.US, "%tR", event.startMillis)
+                val tail = if (event.ongoing) "仍在持续" else "持续 ${eventDurationText(event.durationSeconds)}"
+                Text(
+                    text = "$clock  ${event.type.label} · $tail",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = colors.onSurfaceVariant,
+                )
+            }
+        }
+        Spacer(Modifier.size(6.dp))
+        Text(
+            text = if (events.totalCount == 0) {
+                "近期没有异常记录。提问时，本地模型会参考这些观察。"
+            } else {
+                "提问时，本地模型会参考这些观察（自动检测，可能有误报）。"
+            },
+            style = MaterialTheme.typography.bodySmall,
+            color = colors.onSurfaceVariant,
+        )
     }
 }
 

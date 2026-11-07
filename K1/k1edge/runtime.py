@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import time
 from typing import Any
 
@@ -14,12 +15,16 @@ from services.resources import ResourceMonitor
 from services.activity_zone import ActivityZoneStore, safe_zone_detection_status
 from services.care_log import CareStore
 from services.chat_assistant import ChatAssistant, WorkloadPauser, load_assistant_settings
+from services.event_log import EventLog
 from services.voice_trigger import read_voice_trigger_status, write_voice_trigger_command
 from utils.metrics import age_seconds
-from utils.paths import ACTIVITY_ZONE_FILE, CARE_PROFILE_FILE, CARE_RECORDS_FILE
+from utils.paths import ACTIVITY_ZONE_FILE, CARE_PROFILE_FILE, CARE_RECORDS_FILE, EVENT_LOG_FILE
 
 
 FACE_POINT_THRESHOLD = 0.25
+# Pose / YAMNet results older than this are treated as unknown by the event log.
+EVENT_INPUT_MAX_AGE_S = 5.0
+EVENT_WATCH_INTERVAL_S = 1.0
 
 
 def vision_safety_status(latest: dict[str, Any] | None) -> dict[str, Any]:
@@ -396,12 +401,17 @@ class AppRuntime:
         self.resources = ResourceMonitor()
         self.activity_zone_store = ActivityZoneStore(ACTIVITY_ZONE_FILE)
         self.care = CareStore(CARE_RECORDS_FILE, CARE_PROFILE_FILE)
+        self.events = EventLog(EVENT_LOG_FILE)
+        assistant_settings = load_assistant_settings()
         self.assistant = ChatAssistant(
-            load_assistant_settings(),
+            assistant_settings,
             overview=self.care.overview,
             room=self.hardware.temperature_humidity.status,
             pauser=WorkloadPauser(vision=self.video.vision),
+            events=lambda: self.events.summary(window_s=assistant_settings.event_window_s),
         )
+        self._event_stop = threading.Event()
+        self._event_thread: threading.Thread | None = None
         self.started_at = time.time()
         self.status_aggregator = StatusAggregator(
             config=config,
@@ -425,11 +435,59 @@ class AppRuntime:
     def start(self) -> None:
         self.video.start()
         self.audio.start()
+        self._event_stop.clear()
+        self._event_thread = threading.Thread(target=self._watch_events, name="event-log", daemon=True)
+        self._event_thread.start()
 
     def stop(self) -> None:
+        self._event_stop.set()
+        if self._event_thread is not None:
+            self._event_thread.join(timeout=2.0)
         self.hardware.close()
         self.audio.stop()
         self.video.stop()
+
+    # ---------------------------------------------------------------- event log
+
+    def event_inputs(self, now: float | None = None) -> tuple[dict[str, bool | None], str, dict[str, dict[str, Any]]]:
+        """Current state of each event type for EventLog.observe (None = unknown right now)."""
+        now = time.time() if now is None else now
+        active: dict[str, bool | None] = {"face_cover_rollover": None, "no_person": None, "boundary": None, "cry": None}
+        details: dict[str, dict[str, Any]] = {}
+        latest = self.vision.latest_result()
+        updated_at = latest.get("updated_at") if isinstance(latest, dict) else None
+        if self.vision.paused:
+            vision_state = "paused"  # LLM is answering: keep vision episodes as they are
+        elif updated_at is None:
+            vision_state = "unknown"  # camera off or no pose result yet
+        elif now - float(updated_at) > EVENT_INPUT_MAX_AGE_S:
+            vision_state = "stale"
+        else:
+            safety = vision_safety_status(latest)
+            zone = safe_zone_detection_status(self.activity_zone_store.status(), latest)
+            active["no_person"] = bool(safety.get("no_person"))
+            active["face_cover_rollover"] = bool(safety.get("face_cover_rollover"))
+            active["boundary"] = bool(zone.get("triggered"))
+            vision_state = "no_person" if active["no_person"] else "covered" if active["face_cover_rollover"] else "visible"
+        yamnet = self.audio.latest_yamnet
+        if isinstance(yamnet, dict) and yamnet.get("status") == "ok" and yamnet.get("updated_at") is not None:
+            if now - float(yamnet["updated_at"]) <= EVENT_INPUT_MAX_AGE_S:
+                active["cry"] = yamnet.get("crying") is True
+                if active["cry"]:
+                    details["cry"] = {"score": yamnet.get("cry_score")}
+        return active, vision_state, details
+
+    def observe_events(self, now: float | None = None) -> list[dict[str, Any]]:
+        active, vision_state, details = self.event_inputs(now)
+        return self.events.observe(active, now=now, vision_state=vision_state, details=details)
+
+    def _watch_events(self) -> None:
+        while not self._event_stop.is_set():
+            try:
+                self.observe_events()
+            except Exception as exc:  # never let the event log take the service down
+                print(f"[event-log] {exc}", flush=True)
+            self._event_stop.wait(EVENT_WATCH_INTERVAL_S)
 
     def status(self) -> dict[str, Any]:
         return self.status_aggregator.status()

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from typing import Any, Iterator
@@ -150,6 +151,64 @@ class ContextTests(unittest.TestCase):
         context, facts = build_context({"now": NOW, "profile": {}, "age": None, "today": {}}, {"has_reading": True, "age_s": 9999, "temperature_c": 30})
         self.assertNotIn("室温", context)
         self.assertEqual(facts, ["今日喂养 0 次 · 睡眠 0 分钟"])
+
+    def test_vision_and_cry_episodes_go_into_context(self) -> None:
+        from services.event_log import EventLog
+
+        clock = [NOW - 3000]
+        log = EventLog(None, clock=lambda: clock[0])
+
+        def run(seconds: int, vision_state: str = "visible", **active: Any) -> None:
+            for _ in range(seconds):
+                log.observe(active, now=clock[0], vision_state=vision_state)
+                clock[0] += 1
+
+        run(120, cry=True)          # 2 min of crying
+        run(600, cry=False)
+        run(30, cry=True)           # cries again later
+        run(600, cry=False, face_cover_rollover=False)
+        cover_start = clock[0]
+        run(10, face_cover_rollover=True, vision_state="covered")
+        summary = log.summary(window_s=7200, now=clock[0])
+        context, facts = build_context({**OVERVIEW, "now": clock[0]}, ROOM, summary)
+
+        self.assertIn("摄像头当前画面：疑似遮脸或趴睡", context)
+        self.assertIn("回答时先提醒家长立即查看宝宝", context)
+        self.assertIn("最近 2 小时摄像头和麦克风的自动监测（可能有误报）：哭闹 2 次", context)
+        self.assertIn(f"遮脸/翻身 1 次（最近一次 {time.strftime('%H:%M', time.localtime(cover_start))} 开始，仍在持续）", context)
+        self.assertIn("持续 29 秒", context)  # the second cry episode
+        self.assertEqual(facts[-2], "画面：疑似遮脸/翻身 · 近 2 小时哭闹 2 次 · 遮脸/翻身 1 次")
+        # the event lines come before the room line, which stays last
+        self.assertTrue(context.rstrip().endswith("室温 24.5°C，湿度 51%。"))
+
+    def test_quiet_period_and_unknown_camera(self) -> None:
+        quiet = {"window_s": 7200, "current": {"vision_state": "visible"},
+                 "types": {name: {"count": 0} for name in ("cry", "face_cover_rollover", "boundary", "no_person")}}
+        context, facts = build_context(OVERVIEW, ROOM, quiet)
+        self.assertIn("摄像头当前画面：检测到宝宝，面部可见。", context)
+        self.assertIn("没有哭闹、遮脸/翻身、越界或离开画面的记录", context)
+        self.assertIn("画面：面部可见 · 近 2 小时哭闹 0 次 · 遮脸/翻身 0 次", facts)
+        unknown = {**quiet, "current": {"vision_state": "unknown"}}
+        context, facts = build_context(OVERVIEW, ROOM, unknown)
+        self.assertNotIn("摄像头当前画面", context)
+        self.assertIn("近 2 小时哭闹 0 次 · 遮脸/翻身 0 次", facts)
+        # no event log at all (older board): context unchanged
+        self.assertEqual(build_context(OVERVIEW, ROOM, None), build_context(OVERVIEW, ROOM))
+
+    def test_assistant_sends_event_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            assistant, client, _, _ = make_assistant(tmp)
+            assistant.events = lambda: {"window_s": 7200, "current": {"vision_state": "no_person"},
+                                        "types": {"cry": {"count": 1, "latest": {"start_at": NOW - 600, "duration_s": 120}}}}
+            result = events(assistant.stream([{"role": "user", "content": "宝宝刚才睡得怎么样？"}]))
+            self.assertIn("画面：画面无人 · 近 2 小时哭闹 1 次 · 遮脸/翻身 0 次", result[0]["facts"])
+            system = client.bodies[0]["messages"][0]["content"]
+            self.assertIn("摄像头当前画面：没有检测到宝宝。", system)
+            self.assertIn("哭闹 1 次（最近一次", system)
+            self.assertIn("持续 2 分钟", system)
+            # a broken event log never blocks the answer
+            assistant.events = lambda: (_ for _ in ()).throw(RuntimeError("disk"))
+            self.assertEqual(events(assistant.stream([{"role": "user", "content": "q"}]))[-1]["type"], "done")
 
 
 class StreamTests(unittest.TestCase):

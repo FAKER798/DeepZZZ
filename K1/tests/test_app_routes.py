@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -142,6 +143,48 @@ class AppRouteTests(unittest.TestCase):
         self.assertEqual(play.get_json()["result"]["output_device"], "plughw:CARD=UACDemoV10,DEV=0")
         record_waveform.assert_called_once()
 
+
+    def test_event_inputs_and_routes(self) -> None:
+        from services.event_log import EventLog
+
+        runtime = make_runtime()
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime.events = EventLog(Path(tmp) / "events.json")
+            now = time.time()
+            face_hidden = [[10.0, 10.0, 0.0]] * 3 + [[10.0, 10.0, 0.9]] * 14  # nose/eyes missing, ears visible
+            latest = {"updated_at": now, "captured_at": now, "frame_size": [320, 180], "persons": [{"keypoints": face_hidden}]}
+            runtime.video.vision.latest_result = lambda: latest
+            runtime.audio.pipeline.latest_yamnet = {"status": "ok", "updated_at": now, "crying": True, "cry_score": 0.8}
+
+            active, state, details = runtime.event_inputs(now)
+            self.assertEqual(state, "covered")
+            self.assertEqual(active, {"face_cover_rollover": True, "no_person": False, "boundary": False, "cry": True})
+            self.assertEqual(details["cry"]["score"], 0.8)
+
+            # stale pose result and LLM pause both make vision unknown; cry is still read
+            latest["updated_at"] = now - 30
+            active, state, _ = runtime.event_inputs(now)
+            self.assertEqual((state, active["face_cover_rollover"], active["cry"]), ("stale", None, True))
+            latest["updated_at"] = now
+            runtime.vision.pause("assistant")
+            self.assertEqual(runtime.event_inputs(now)[1], "paused")
+            runtime.vision.resume("assistant")
+
+            for second in range(4):
+                runtime.observe_events(now + second)
+            client = create_main_app(runtime).test_client()
+            listed = client.get("/api/events?limit=10").get_json()
+            self.assertIs(listed["ok"], True)
+            self.assertEqual(sorted(e["type"] for e in listed["result"]), ["cry", "face_cover_rollover"])
+            only_cry = client.get("/api/events?type=cry").get_json()["result"]
+            self.assertEqual([e["type"] for e in only_cry], ["cry"])
+            summary = client.get("/api/events/summary?window_s=3600").get_json()["result"]
+            self.assertEqual(summary["types"]["cry"]["count"], 1)
+            self.assertEqual(summary["current"]["vision_state"], "covered")
+            bad = client.get("/api/events?type=sneeze")
+            self.assertEqual(bad.status_code, 400)
+            self.assertIs(bad.get_json()["ok"], False)
+            self.assertEqual(client.get("/api/events/summary?window_s=5").status_code, 400)
 
     def test_assistant_routes(self) -> None:
         from tests.test_chat_assistant import FakeOllama

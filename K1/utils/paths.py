@@ -36,6 +36,8 @@ VOICE_SEGMENT_DIR = AUDIO_DIR / "voice"
 CARE_DIR = RUNTIME_DIR / "care"
 CARE_RECORDS_FILE = CARE_DIR / "records.json"
 CARE_PROFILE_FILE = CARE_DIR / "profile.json"
+# Vision / sound episodes (services/event_log.py)
+EVENT_LOG_FILE = CARE_DIR / "events.json"
 
 
 def ensure_runtime_dirs() -> None:

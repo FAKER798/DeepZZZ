@@ -104,6 +104,12 @@ interface BoardApi {
 
     fun assistantStatus(): AssistantStatus?
 
+    /** Vision / cry episodes of the last [windowSeconds]; null on older boards without the event log. */
+    fun eventSummary(windowSeconds: Int = 7200): BoardEventSummary?
+
+    /** Episodes newest first; null on older boards without the event log. */
+    fun events(sinceMillis: Long? = null, type: BoardEventType? = null, limit: Int = 20): List<BoardEvent>?
+
     /**
      * Asks the board's local LLM and blocks until the answer ends, reporting each [AssistantEvent]
      * as it arrives. Always finishes with [AssistantEvent.Done] or [AssistantEvent.Failed] unless
@@ -535,6 +541,36 @@ class LanBoardApi(
             },
             parse = { it.optJSONObject("result")?.toCareProfile() },
         )
+    }
+
+    override fun eventSummary(windowSeconds: Int): BoardEventSummary? {
+        return runCatching {
+            val response = client.get("/api/events/summary?window_s=$windowSeconds")
+            if (!response.ok) return@runCatching null
+            val json = JSONObject(response.body)
+            if (!json.optBoolean("ok", false)) return@runCatching null
+            json.optJSONObject("result")?.toBoardEventSummary()
+        }.getOrNull()
+    }
+
+    override fun events(sinceMillis: Long?, type: BoardEventType?, limit: Int): List<BoardEvent>? {
+        val query = buildList {
+            if (sinceMillis != null) add("since=$sinceMillis")
+            if (type != null) add("type=${type.apiValue}")
+            add("limit=$limit")
+        }.joinToString("&")
+        return runCatching<List<BoardEvent>?> {
+            val response = client.get("/api/events?$query")
+            if (!response.ok) return@runCatching null
+            val json = JSONObject(response.body)
+            if (!json.optBoolean("ok", false)) return@runCatching null
+            val items = json.optJSONArray("result") ?: return@runCatching emptyList()
+            buildList<BoardEvent> {
+                for (index in 0 until items.length()) {
+                    items.optJSONObject(index)?.toBoardEvent()?.let(::add)
+                }
+            }
+        }.getOrNull()
     }
 
     override fun assistantStatus(): AssistantStatus? {
