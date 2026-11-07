@@ -44,7 +44,7 @@ DeepZZZ/
 │   ├── devices/                # 摄像头、麦克风、PWM 补光、DHT11、IR-CUT、昼夜检测
 │   ├── web/                    # Web 调试后台
 │   ├── scripts/                # systemd 单元、模型安装、基准测试
-│   ├── tests/                  # 84 个无硬件单元测试
+│   ├── tests/                  # 99 个无硬件单元测试
 │   ├── .brdk_models/pose/      # K1 INT8 姿态模型（3.6 MB）
 │   └── models/yamnet/          # YAMNet 模型与标签
 ├── app/naviga/                 # 眠屿看护 Android App（Kotlin + Jetpack Compose）

@@ -195,9 +195,17 @@ class WorkerTests(unittest.TestCase):
         for text in ("宝宝喂母乳吗？", "换尿布了吗", "宝宝睡着了吗", "喂奶了没", "要不要换尿布"):
             self.assertEqual(events(text), [], text)
         # Modal particles are statements, even when the ASR adds a question mark.
-        for text in ("宝宝未奶粉呢？", "宝宝喂奶呢", "在喂奶了没呢", "换尿布吧", "换尿布啊", "宝宝喂奶呀",
+        for text in ("宝宝喂奶粉呢？", "宝宝喂奶呢", "在喂奶了没呢", "换尿布吧", "换尿布啊", "宝宝喂奶呀",
                      "换尿布啦", "喂奶哦", "喂奶嘛", "宝宝睡着了呢"):
             self.assertEqual(len(events(text)), 1, text)
+
+    def test_misheard_question_is_still_logged_via_pinyin(self) -> None:
+        from services.pinyin_match import default_table
+
+        if not default_table():
+            self.skipTest("pinyin table not available")
+        # ASR heard 喂 as 未; the pinyin match recovers the feeding.
+        self.assertEqual(len(events("宝宝未奶粉呢？")), 1)
 
     def test_app_record_is_not_duplicated(self) -> None:
         clock = Clock()

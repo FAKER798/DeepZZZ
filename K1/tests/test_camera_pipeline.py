@@ -55,13 +55,27 @@ class CameraPipelineCommandTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             pipeline = self.make_pipeline(Path(tmp))
-            pipeline._process = SimpleNamespace(stdout=io.BytesIO(first.tobytes() + second.tobytes()))
-            pipeline._read_source_pipe()
+            process = SimpleNamespace(stdout=io.BytesIO(first.tobytes() + second.tobytes()))
+            pipeline._read_source_pipe(process, pipeline._generation)
 
         self.assertEqual(pipeline._source_sequence, 2)
         self.assertEqual(pipeline._source_jpeg, second.tobytes())
+        # The high-res preview is the camera's own JPEG, passed through without re-encoding.
+        self.assertEqual(pipeline.latest_preview_jpeg(), second.tobytes())
 
-    def test_latest_source_frame_generates_both_outputs(self) -> None:
+    def test_reader_of_a_replaced_capture_process_stops_writing(self) -> None:
+        _, frame = cv2.imencode(".jpg", np.full((8, 8, 3), 17, dtype=np.uint8))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline = self.make_pipeline(Path(tmp))
+            stale_generation = pipeline._generation
+            pipeline._generation += 1  # the watchdog restarted ffmpeg
+            pipeline._read_source_pipe(SimpleNamespace(stdout=io.BytesIO(frame.tobytes())), stale_generation)
+
+        self.assertEqual(pipeline._source_sequence, 0)
+        self.assertIsNone(pipeline.latest_preview_jpeg())
+
+    def test_latest_source_frame_becomes_low_res_analysis_frame(self) -> None:
         frame = np.full((720, 1280, 3), 91, dtype=np.uint8)
         _, encoded = cv2.imencode(".jpg", frame)
         received = []
@@ -73,7 +87,6 @@ class CameraPipelineCommandTests(unittest.TestCase):
 
         self.assertEqual(received[0][0].shape, (180, 320, 3))
         self.assertEqual(received[0][1]["captured_at"], 123.0)
-        self.assertIsNotNone(pipeline.latest_preview_jpeg())
 
 if __name__ == "__main__":
     unittest.main()
