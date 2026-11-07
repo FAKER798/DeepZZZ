@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Board runtime output (recordings, logs, state, care records)
+K1/runtime/
+runtime/
+
+# Large models downloaded by scripts (see K1/scripts/install_asr_models.sh)
+K1/models/asr/
+
+# Compiled DHT11 reader (built on the board by temperature-humodity.service)
+K1/devices/dht11_reader
+
+# Rebuild scratch files from the board
+pre-rebuild-working-tree*.patch
+pre-rebuild-working-tree*.txt
+pre-audio-playback-working-tree*.patch
+pre-audio-playback-working-tree*.txt
+
+# Office lock files
+~$*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/

@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>DeepZZZ K1 Edge</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>DeepZZZ K1 Edge</h1>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <section class="viewer comparePanel">
+        <div class="sectionHead">
+          <h2>HD Preview</h2>
+        </div>
+        <div class="videoFrame">
+          <img id="video" alt="" />
+          <canvas id="overlay"></canvas>
+        </div>
+      </section>
+
+      <section class="viewer comparePanel lowresPanel">
+        <div class="sectionHead">
+          <h2>Lowres Analysis</h2>
+          <span id="sleepState" class="sleepState asleep">asleep</span>
+        </div>
+        <div class="videoFrame imageFrame">
+          <img id="snapshot" alt="" />
+          <canvas id="zoneOverlay"></canvas>
+        </div>
+      </section>
+
+      <section class="viewer comparePanel skeletonPanel">
+        <div class="sectionHead">
+          <h2>Skeleton</h2>
+        </div>
+        <div class="skeletonFrame">
+          <canvas id="poseModel" width="260" height="260"></canvas>
+        </div>
+      </section>
+
+      <section class="controlPanel">
+        <div class="summaryGrid">
+          <div class="summaryItem">
+            <div class="summaryMetric">
+              <span>画面延迟</span>
+              <strong id="videoAgeSummary">-</strong>
+            </div>
+            <div class="summaryMetric">
+              <span>画面帧率</span>
+              <strong id="videoFpsSummary">-</strong>
+            </div>
+          </div>
+          <div class="summaryItem">
+            <div class="summaryMetric">
+              <span>音频延迟</span>
+              <strong id="audioAgeSummary">-</strong>
+            </div>
+            <div class="summaryMetric">
+              <span>音频帧率</span>
+              <strong id="audioRateSummary">-</strong>
+            </div>
+          </div>
+          <div class="summaryItem">
+            <div class="summaryMetric">
+              <span>CPU</span>
+              <strong id="cpuSummary">-</strong>
+            </div>
+            <div class="summaryMetric">
+              <span>内存</span>
+              <strong id="memorySummary">-</strong>
+            </div>
+          </div>
+          <div class="summaryItem">
+            <div class="summaryMetric">
+              <span>AI 推理负载</span>
+              <strong id="npuSummary">-</strong>
+            </div>
+            <div class="summaryMetric">
+              <span>昼夜</span>
+              <strong id="dayNightSummary">-</strong>
+            </div>
+          </div>
+          <div class="summaryItem">
+            <div class="summaryMetric">
+              <span>温度</span>
+              <strong id="temperatureSummary">-</strong>
+            </div>
+            <div class="summaryMetric">
+              <span>湿度</span>
+              <strong id="humiditySummary">-</strong>
+            </div>
+          </div>
+          <div class="summaryItem controlItem">
+            <div class="controlHead">
+              <span>Light</span>
+              <strong id="lightDutyText" class="srOnly">-</strong>
+            </div>
+            <div class="lightControlRow">
+              <input id="lightSlider" type="range" min="0" max="100" step="1" value="50" />
+              <input id="lightDutyInput" type="number" min="0" max="100" step="1" value="50" />
+            </div>
+            <div class="lightButtons">
+              <button type="button" data-light-duty="0">0</button>
+              <button type="button" data-light-duty="25">25</button>
+              <button type="button" data-light-duty="50">50</button>
+              <button type="button" data-light-duty="100">100</button>
+            </div>
+            <div class="lightStatus" id="lightStatus">waiting</div>
+          </div>
+          <div class="summaryItem controlItem" id="audioPlaybackPanel">
+            <div class="controlHead">
+              <span>Audio</span>
+              <strong id="playbackVolumeValue" class="srOnly">1.0x</strong>
+            </div>
+            <strong id="audioPlaybackState" class="srOnly">idle</strong>
+            <div class="lightControlRow">
+              <input id="playbackVolumeRange" type="range" min="0" max="2" step="0.1" value="1" />
+              <input id="playbackVolume" type="number" min="0" max="2" step="0.1" value="1" />
+            </div>
+            <div class="playbackButtons">
+              <button id="captureButton" type="button">Start</button>
+              <button id="playbackButton" type="button" disabled>Play</button>
+            </div>
+            <div class="playbackStatus" id="audioPlaybackStatus">waiting</div>
+            <strong id="playbackDevice" class="srOnly">USB audio</strong>
+            <a class="playbackLink" id="audioPlaybackLink" href="#" target="_blank" rel="noreferrer">latest sample</a>
+          </div>
+        </div>
+      </section>
+
+      <div class="alertGrid">
+        <section class="alertPanel panel" id="faceCoverPanel">
+          <h2>Face Cover / Rollover Detection</h2>
+          <dl class="metricsGrid">
+            <dt>Status</dt><dd id="coverStatus">waiting</dd>
+            <dt>Reason</dt><dd id="coverReason">-</dd>
+            <dt>Visible face points</dt><dd id="coverVisiblePoints">-</dd>
+            <dt>Nose</dt><dd id="coverNose">-</dd>
+            <dt>Left eye</dt><dd id="coverLeftEye">-</dd>
+            <dt>Right eye</dt><dd id="coverRightEye">-</dd>
+            <dt>Left ear</dt><dd id="coverLeftEar">-</dd>
+            <dt>Right ear</dt><dd id="coverRightEar">-</dd>
+          </dl>
+        </section>
+
+        <section class="alertPanel panel caution" id="cryDetectionPanel">
+          <div class="panelHead">
+            <h2>Cry Detection</h2>
+            <span id="cryLoopState">auto</span>
+          </div>
+          <dl class="metricsGrid" id="yamnetMetrics">
+            <dt>Cry status</dt><dd id="yamnetStatus">No YAMNet sample</dd>
+            <dt>Cry score</dt><dd id="yamnetCryScore">-</dd>
+            <dt>Noise</dt><dd id="yamnetNoise">-</dd>
+            <dt>Window</dt><dd id="yamnetWindow">-</dd>
+            <dt>Top sounds</dt><dd id="yamnetTop">-</dd>
+            <dt>YAMNet latency</dt><dd id="yamnetLatency">-</dd>
+          </dl>
+        </section>
+
+        <section class="alertPanel panel caution" id="voiceTriggerPanel">
+          <div class="panelHead">
+            <h2>Voice Care Log</h2>
+            <button type="button" id="voiceTriggerToggle">-</button>
+          </div>
+          <dl class="metricsGrid">
+            <dt>Status</dt><dd id="voiceTriggerState">waiting</dd>
+            <dt>Heard</dt><dd id="voiceTriggerHeard">-</dd>
+            <dt>Last record</dt><dd id="voiceTriggerAction">-</dd>
+            <dt>Today</dt><dd id="careToday">-</dd>
+            <dt>Recent</dt><dd id="careRecent">-</dd>
+            <dt>ASR latency</dt><dd id="voiceTriggerLatency">-</dd>
+          </dl>
+        </section>
+      </div>
+
+      <aside class="sidebar">
+        <section class="panel">
+          <h2>Device</h2>
+          <dl id="device">
+            <dt>Camera</dt><dd id="deviceCamera">-</dd>
+            <dt>Video</dt><dd id="deviceVideo">-</dd>
+            <dt>Lowres frame</dt><dd id="deviceAnalysis">-</dd>
+            <dt>Microphone</dt><dd id="deviceMic">-</dd>
+            <dt>Audio sample</dt><dd id="deviceAudio">-</dd>
+            <dt>Cry detector</dt><dd id="deviceCry">-</dd>
+          </dl>
+        </section>
+
+        <section class="panel">
+          <h2>Resources</h2>
+          <dl id="resources">
+            <dt>CPU</dt><dd id="resourceCpu">-</dd>
+            <dt>Memory</dt><dd id="resourceMemory">-</dd>
+            <dt>main.py</dt><dd id="resourceApp">-</dd>
+            <dt>ffmpeg</dt><dd id="resourceFfmpeg">-</dd>
+          </dl>
+        </section>
+      </aside>
+    </main>
+
+    <script src="/static/app.js?v=voice-care-20261105"></script>
+  </body>
+</html>

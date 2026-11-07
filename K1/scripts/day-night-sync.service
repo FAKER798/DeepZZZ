@@ -1,0 +1,17 @@
+[Unit]
+Description=Day/Night GPIO to IR-CUT Sync
+After=local-fs.target
+
+[Service]
+Type=simple
+User=z
+Group=z
+WorkingDirectory=/home/z
+ExecStart=/usr/bin/python3 /home/z/scripts/day_night.py sync-ircut --sync-camera --day-saturation 100 --night-saturation 0 --camera-delay-ms 0 --debounce-ms 300 --interval-ms 200
+Restart=always
+RestartSec=2
+StandardOutput=append:/home/z/runtime/logs/sync_day_night_ircut.log
+StandardError=append:/home/z/runtime/logs/sync_day_night_ircut.log
+
+[Install]
+WantedBy=multi-user.target

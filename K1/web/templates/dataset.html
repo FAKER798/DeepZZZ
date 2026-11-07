@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Dataset Capture</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+    <link rel="stylesheet" href="/static/dataset.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>Dataset Capture</h1>
+      </div>
+      <div class="status" id="status">connecting</div>
+    </header>
+
+    <main class="captureWorkspace">
+      <section class="comparePanel liveCapture">
+        <div class="sectionHead">
+          <h2>Live Raw Lowres</h2>
+          <span id="liveMeta">waiting</span>
+        </div>
+        <div class="videoFrame imageFrame">
+          <img id="liveSnapshot" alt="" />
+        </div>
+      </section>
+
+      <section class="comparePanel reviewCapture">
+        <div class="sectionHead">
+          <h2>Pending Raw Review</h2>
+          <span id="pendingMeta">no pending sample</span>
+        </div>
+        <div class="captureField">
+          <span>光线</span>
+          <div class="segmented" role="radiogroup" aria-label="光线分类">
+            <label><input type="radio" name="lightLabel" value="day" />白天</label>
+            <label><input type="radio" name="lightLabel" value="night_ir" />夜间红外</label>
+            <label><input type="radio" name="lightLabel" value="low_light" />弱光</label>
+          </div>
+        </div>
+        <div class="videoFrame imageFrame">
+          <img id="pendingRaw" alt="" />
+        </div>
+        <div class="captureButtons">
+          <button id="captureBtn" type="button">拍摄</button>
+          <button id="confirmBtn" type="button" disabled>确认</button>
+          <button id="cancelBtn" type="button" disabled>取消</button>
+        </div>
+      </section>
+
+      <section class="panel captureStats">
+        <h2>Storage</h2>
+        <dl>
+          <dt>Root</dt><dd id="datasetRoot">-</dd>
+          <dt>Raw</dt><dd id="rawCount">-</dd>
+          <dt>Meta</dt><dd id="metaCount">-</dd>
+          <dt>Pending</dt><dd id="pendingCount">-</dd>
+          <dt>Last</dt><dd id="lastSample">-</dd>
+        </dl>
+      </section>
+    </main>
+
+    <script src="/static/dataset.js"></script>
+  </body>
+</html>

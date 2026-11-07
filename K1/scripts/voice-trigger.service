@@ -1,0 +1,18 @@
+[Unit]
+Description=DeepZZZ voice care-log worker (SenseVoice ASR: diaper/feeding/sleep -> care records)
+After=deepzzz-k1-edge.service
+Wants=deepzzz-k1-edge.service
+
+[Service]
+Type=simple
+User=z
+WorkingDirectory=/home/z
+Environment=PYTHONUNBUFFERED=1
+Environment="PYTHONPATH=/opt/spacemit-ort/2.0.5/python"
+# main.py is pinned to cores 4-7 (camera/pose/YAMNet); ASR uses the idle cores 0-3.
+ExecStart=/usr/bin/taskset -c 0-3 /usr/bin/nice -n 5 /usr/bin/python3 /home/z/services/voice_trigger.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

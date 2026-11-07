@@ -1,0 +1,19 @@
+[Unit]
+Description=DeepZZZ K1 Mirrored PWM4 + PWM7 Worker (controlled from port 7860)
+After=local-fs.target light-pwm.service
+# The old single-channel light worker also writes PWM4; never run both.
+Conflicts=light-pwm.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/z
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/home/z
+ExecStart=/usr/bin/python3 /home/z/pwm_control.py --frequency-hz 10000
+Restart=always
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

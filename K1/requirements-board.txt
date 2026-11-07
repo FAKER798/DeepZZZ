@@ -1,0 +1,4 @@
+# Prefer Bianbu apt packages on the board:
+#   sudo apt install python3-opencv python3-numpy python3-flask python3-scipy python3-spacemit-ort onnxruntime ffmpeg v4l-utils alsa-utils
+#
+# This project intentionally avoids pip-only desktop packages such as mediapipe.

@@ -1,0 +1,40 @@
+[Unit]
+Description=DeepZZZ K1 Edge Web Service
+After=network-online.target local-fs.target
+Wants=network-online.target
+Conflicts=camera-hls.service camera-web.service
+
+[Service]
+Type=simple
+User=z
+Group=z
+WorkingDirectory=/home/z
+Environment=HOST=0.0.0.0
+Environment=PORT=7860
+Environment=DATASET_CAPTURE_PORT=7861
+Environment=ENABLE_POSE=1
+Environment=POSE_MODEL=/home/z/.brdk_models/pose/yolov8n-pose-k1-320-int8.onnx
+Environment=POSE_PROVIDER=SpaceMITExecutionProvider
+Environment=POSE_PROVIDER_FALLBACK=0
+Environment="PYTHONPATH=/opt/spacemit-ort/2.0.5/python"
+Environment=LOW_LIGHT_MODE=off
+Environment=LOW_LIGHT_GAMMA=1.35
+Environment=LOW_LIGHT_CLAHE_CLIP=2.0
+Environment=LOW_LIGHT_DESATURATE=0
+Environment=ENABLE_DATASET_CAPTURE=1
+Environment=ANALYSIS_WIDTH=320
+Environment=ANALYSIS_FPS=15
+Environment=PREVIEW_FPS=30
+Environment=AUDIO_DEVICE=plughw:CARD=UACDemoV10,DEV=0
+Environment=AUDIO_OUTPUT_DEVICE=plughw:CARD=UACDemoV10,DEV=0
+Environment=AUDIO_RATE=16000
+Environment=YAMNET_SECONDS=2
+Environment=YAMNET_INTERVAL=0.5
+ExecStart=/usr/bin/taskset -c 4-7 /usr/bin/python3 /home/z/main.py
+Restart=always
+RestartSec=1
+StandardOutput=append:/home/z/runtime/logs/app.out.log
+StandardError=append:/home/z/runtime/logs/app.err.log
+
+[Install]
+WantedBy=multi-user.target

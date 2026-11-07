@@ -1,0 +1,17 @@
+[Unit]
+Description=DeepZZZ K1 Light PWM Worker
+After=local-fs.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/z
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/home/z
+ExecStart=/usr/bin/python3 /home/z/devices/lightcontrol.py --gpio 74 --frequency-hz 10000 --pwmchip auto --pwm-device d401b000.pwm --channel 0 --poll-ms 50 --pinmux-address 0xd401e08c --pinmux-value 0x0000d043 --active-high
+Restart=always
+RestartSec=1
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

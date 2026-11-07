@@ -1,0 +1,23 @@
+[Unit]
+Description=DeepZZZ K1 Temperature Humidity Worker
+After=local-fs.target
+
+[Service]
+Type=simple
+User=z
+Group=z
+WorkingDirectory=/home/z
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/home/z
+AmbientCapabilities=CAP_SYS_NICE
+CapabilityBoundingSet=CAP_SYS_NICE
+LimitRTPRIO=20
+ExecStartPre=/usr/bin/gcc -O2 -Wall -Wextra -o /home/z/devices/dht11_reader /home/z/devices/dht11_reader.c
+ExecStart=/usr/bin/python3 /home/z/devices/temperature_humidity.py --gpio 92 --chip gpiochip0 --interval-ms 2500 --pull-up --attempts 5 --retry-ms 1200
+Restart=always
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
